@@ -4,11 +4,19 @@ use linux_futex::{AsFutex, Futex, Shared};
 
 use crate::{data, frame, ring, uapi};
 
+/// A client accessing an SHM-PBX map.
+///
+/// Each client, by its identifier that matches a process ID, can attempt to join any number of
+/// rings on the map at any side, resulting in a [`Ring`] each.
 pub struct Client {
     ring: frame::Shared,
     head: ClientHead,
 }
 
+/// An owning wrapper of a portion of a ring on the SHM-PBX map.
+///
+/// This structure should not be forgotten. Doing so will effectively block the owned side until
+/// the process with which the side was taken is reaped.
 pub struct Ring {
     ring: frame::Shared,
     map: RingMap,
@@ -16,17 +24,29 @@ pub struct Ring {
     ring_id: data::RingIdentifier,
 }
 
+/// A borrowing lock between two sides of a ring.
+///
+/// This allows the two sides to compete for a resource if it's unclear for a protocol which side
+/// must be activately attempting to make progress and which is waiting. The assertion can be
+/// discarded to the ring itself to signal that a connection is about to enter a closing state and
+/// may no longer make progress, just cleaning up any messages still to be processed.
 pub struct RingAssertion<'lt> {
     block: &'lt atomic::AtomicU32,
     owner: u32,
 }
 
+/// Input data for a [`Client`] to join a [`Ring`] on one side..
 pub struct RingRequest {
     pub index: data::RingIndex,
     pub side: data::ClientSide,
     pub tid: data::ClientIdentifier,
 }
 
+/// The read-out descriptor of a ring.
+///
+/// May not change except while the ring is owned by the SHM-PBX maintainer. It is read out with
+/// atomic instructions in any case, but is only absolutely coherent if read out while owning at
+/// least one side of a ring.
 #[derive(Debug)]
 pub struct RingAttributes {
     /// The offset at which to find this rings head structure.
@@ -98,7 +118,7 @@ struct OwnedRingSlot {
 }
 
 struct RingMap {
-    head: &'static data::ShmHead,
+    pbx_head: &'static data::ShmHead,
     ring_slot: OwnedRingSlot,
 }
 
@@ -148,6 +168,10 @@ impl Client {
         };
 
         Ok(Client { ring, head })
+    }
+
+    pub(crate) fn shared_head(&self) -> &data::ShmHead {
+        self.head.head
     }
 
     pub(crate) fn shared_ring(&self) -> &frame::Shared {
@@ -200,7 +224,7 @@ impl Client {
         };
 
         let frame = RingMap {
-            head: self.head.head,
+            pbx_head: self.head.head,
             ring_slot: owned_ring,
         };
 
@@ -219,6 +243,13 @@ impl Client {
 }
 
 impl Ring {
+    /// Create an awaitable object that represents modifications to the ring itself, such as
+    /// joining. This is not necessary for correctness, but nice to other parties. It ensures the
+    /// server has picked up the structure after that sequential point for instance.
+    pub fn awaitable(&self) -> data::ClientAwaitable {
+        self.map.pbx_head.client_bump()
+    }
+
     /// Get the identity used when joining the ring.
     pub fn identity(&self) -> data::ClientIdentifier {
         self.map.ring_slot.identity

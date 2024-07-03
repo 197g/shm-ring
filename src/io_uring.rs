@@ -4,7 +4,8 @@
 /// Similar to pre-registered files this can hold shared reference counts to the memory mapping
 /// itself, which makes the futex operations referring to within those regions sound. The rings are
 /// kept alive while submitted operations are running on the ring, until the completions are found.
-use crate::client::{Ring, WaitResult};
+use crate::client::{Client, Ring, WaitResult};
+use crate::data::ClientAwaitable;
 use crate::frame::Shared;
 use crate::server::Server;
 use crate::uapi::FutexWaitv;
@@ -157,6 +158,71 @@ impl ShmIoUring {
             false => SupportLevel::None,
             true => SupportLevel::V1,
         })
+    }
+
+    pub async fn wait_client(
+        &self,
+        client: &Client,
+        awaitable: &ClientAwaitable,
+        mut timeout: time::Duration,
+    ) -> Result<WaitResult, std::io::Error> {
+        let head = client.shared_head();
+        let compare = &head.ring_ping.ring_pong.0;
+
+        let key = self.establish_notice();
+        let mut now = std::time::Instant::now();
+
+        let mut timespec = Rc::new(uapi::c::timespec {
+            tv_nsec: timeout.subsec_nanos().into(),
+            tv_sec: timeout.as_secs() as uapi::c::time_t,
+        });
+
+        loop {
+            let submit = self.non_empty_submission_and_then_sync(2).await?;
+            let loaded = compare.load(atomic::Ordering::Acquire);
+
+            if loaded.wrapping_sub(awaitable.bumped) as i32 >= 0 {
+                return Ok(WaitResult::Ok);
+            }
+
+            let mut wakes = Rc::new([(); 1].map(|_| FutexWaitv::pending()));
+            let [fblock] = Rc::get_mut(&mut wakes).unwrap();
+
+            // Safety: we're owning the ring, which the block references. This keeps it alive for as
+            // long as this futex wait is in the kernel, i.e. until everything was reaped. If we can't,
+            // the Arc is leaked thus keeping the io-uring itself alive with the memory mapping.
+            *fblock = unsafe { FutexWaitv::from_u32_unchecked(compare, loaded) };
+
+            let entry = opcode::FutexWaitV::new(Rc::as_ptr(&wakes) as *const _, 1)
+                .build()
+                .user_data(key.as_user_data())
+                .flags(io_uring::squeue::Flags::IO_LINK);
+
+            // FIXME: wouldn't it be nicer to have an absolute timeout?
+            let entry_to = opcode::LinkTimeout::new(Rc::as_ptr(&timespec) as *const _).build();
+            unsafe { submit.redeem_push(&[entry, entry_to], [wakes, timespec.clone()]) };
+
+            match key.wait().await {
+                Ok(0) => return Ok(WaitResult::Ok),
+                Err(FutexWaitv::EAGAIN) => {}
+                Err(FutexWaitv::ERESTARTSYS) => {}
+                Err(FutexWaitv::ETIMEDOUT | FutexWaitv::ECANCELED) => {
+                    return Ok(WaitResult::Timeout)
+                }
+                Err(errno) => return Err(std::io::Error::from_raw_os_error(errno)),
+                Ok(_) => return Ok(WaitResult::Error),
+            }
+
+            let elapsed = now.elapsed();
+            now += elapsed;
+
+            // Account for the remaining time.
+            timeout = timeout.saturating_sub(elapsed);
+            *Rc::make_mut(&mut timespec) = uapi::c::timespec {
+                tv_nsec: timeout.subsec_nanos().into(),
+                tv_sec: timeout.as_secs() as uapi::c::time_t,
+            };
+        }
     }
 
     pub async fn wait_server(

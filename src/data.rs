@@ -12,6 +12,11 @@ pub struct ShmHead {
     pub ring_ping: RingPing,
 }
 
+#[repr(C)]
+pub struct ClientAwaitable {
+    pub bumped: u32,
+}
+
 #[derive(Default)]
 pub struct RingPing {
     pub ring_ping: RingClientPing,
@@ -282,6 +287,25 @@ impl<'lt> IntoIterator for &'lt Rings {
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.iter()
+    }
+}
+
+impl ShmHead {
+    pub fn client_bump(&self) -> ClientAwaitable {
+        // We want to ensure that our state modifications, whatever they are, have surely
+        // reached the server when it bumps the ring_pong state to the returned value. In
+        // the ok case this is ensured by a release barrier–when it has noted the ping to
+        // move to or after the value, a sequence of happens-before is present that ensures
+        // our other modifications have also reached the server and it will react
+        // accordingly. However, if other threads are simultaneously hammering the server
+        // this write as a CAD might fail. Others might move the ping quicker than we.
+        //
+        // We need to perform an actual write, however, for Release ordering to work. Absent a
+        // better protocol (i.e. using SeqCst when necessary) we shall instead do the fetch_add
+        // which is not necessarily hazard free but almost surely is in practice.
+        let pre = self.ring_ping.ring_ping.0.fetch_add(1, Ordering::Release);
+        let bumped = pre.wrapping_add(1);
+        ClientAwaitable { bumped }
     }
 }
 
