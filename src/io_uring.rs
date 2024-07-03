@@ -5,7 +5,7 @@
 /// itself, which makes the futex operations referring to within those regions sound. The rings are
 /// kept alive while submitted operations are running on the ring, until the completions are found.
 use crate::client::{Client, Ring, WaitResult};
-use crate::data::ClientAwaitable;
+use crate::data::{ClientAwaitable, ServerAwaited};
 use crate::frame::Shared;
 use crate::server::Server;
 use crate::uapi::FutexWaitv;
@@ -90,6 +90,9 @@ enum BlockStrategy {
     Indicate,
 }
 
+/// Used to wake all waiters.
+const FUTEX_WAKE_MAX: u64 = i32::MAX as u64;
+
 /// Implements the client interfaces through queueing on the wrapped ring.
 impl ShmIoUring {
     pub fn new(shared_user_ring: &Shared) -> Result<Self, std::io::Error> {
@@ -163,13 +166,13 @@ impl ShmIoUring {
     pub async fn wait_client(
         &self,
         client: &Client,
-        awaitable: &ClientAwaitable,
+        awaitable: ClientAwaitable,
         mut timeout: time::Duration,
     ) -> Result<WaitResult, std::io::Error> {
         let head = client.shared_head();
+        let server = &head.ring_ping.ring_ping.0;
         let compare = &head.ring_ping.ring_pong.0;
 
-        let key = self.establish_notice();
         let mut now = std::time::Instant::now();
 
         let mut timespec = Rc::new(uapi::c::timespec {
@@ -178,29 +181,48 @@ impl ShmIoUring {
         });
 
         loop {
-            let submit = self.non_empty_submission_and_then_sync(2).await?;
+            let key = self.establish_notice();
+
+            let submit = self.non_empty_submission_and_then_sync(3).await?;
             let loaded = compare.load(atomic::Ordering::Acquire);
 
             if loaded.wrapping_sub(awaitable.bumped) as i32 >= 0 {
                 return Ok(WaitResult::Ok);
             }
 
-            let mut wakes = Rc::new([(); 1].map(|_| FutexWaitv::pending()));
-            let [fblock] = Rc::get_mut(&mut wakes).unwrap();
+            let wake_server = opcode::FutexWake::new(
+                server.as_ptr(),
+                // Wakeup everyone.
+                FUTEX_WAKE_MAX,
+                u32::MAX.into(),
+                // On this 32-bit futex.
+                FutexWaitv::ATOMIC_U32,
+            )
+            .build()
+            .flags(io_uring::squeue::Flags::IO_HARDLINK);
+
+            let mut wakes_on = Rc::new([(); 1].map(|_| FutexWaitv::pending()));
+            let [fblock] = Rc::get_mut(&mut wakes_on).unwrap();
 
             // Safety: we're owning the ring, which the block references. This keeps it alive for as
             // long as this futex wait is in the kernel, i.e. until everything was reaped. If we can't,
             // the Arc is leaked thus keeping the io-uring itself alive with the memory mapping.
             *fblock = unsafe { FutexWaitv::from_u32_unchecked(compare, loaded) };
 
-            let entry = opcode::FutexWaitV::new(Rc::as_ptr(&wakes) as *const _, 1)
+            let entry = opcode::FutexWaitV::new(Rc::as_ptr(&wakes_on) as *const _, 1)
                 .build()
                 .user_data(key.as_user_data())
                 .flags(io_uring::squeue::Flags::IO_LINK);
 
             // FIXME: wouldn't it be nicer to have an absolute timeout?
             let entry_to = opcode::LinkTimeout::new(Rc::as_ptr(&timespec) as *const _).build();
-            unsafe { submit.redeem_push(&[entry, entry_to], [wakes, timespec.clone()]) };
+
+            unsafe {
+                submit.redeem_push(
+                    &[wake_server, entry, entry_to],
+                    [Rc::new(()), wakes_on, timespec.clone()],
+                )
+            };
 
             match key.wait().await {
                 Ok(0) => return Ok(WaitResult::Ok),
@@ -229,16 +251,17 @@ impl ShmIoUring {
         &self,
         server: &Server,
         timeout: time::Duration,
-    ) -> Result<WaitResult, std::io::Error> {
+    ) -> Result<(WaitResult, ServerAwaited), std::io::Error> {
         assert!(self.shared_user_ring.same_server(server));
 
         let head = server.head();
         let assertion = &head.ring_ping.ring_ping.0;
-        let loaded = assertion.load(atomic::Ordering::Relaxed);
+        let loaded = assertion.load(atomic::Ordering::Acquire);
         let cmp = head.ring_ping.ring_pong.0.load(atomic::Ordering::Relaxed);
 
         if loaded.wrapping_sub(cmp) as i32 > 0 {
-            return Ok(WaitResult::Ok);
+            let awaited = ServerAwaited { bumped: loaded };
+            return Ok((WaitResult::Ok, awaited));
         }
 
         let submit = self.non_empty_submission_and_then_sync(2).await?;
@@ -271,14 +294,49 @@ impl ShmIoUring {
 
         unsafe { submit.redeem_push(&[entry, entry_to], [wakes, timespec]) };
 
-        Ok(match key.wait().await {
+        let status = match key.wait().await {
             Ok(0) => WaitResult::Ok,
             Err(FutexWaitv::EAGAIN) => WaitResult::Error,
             Err(FutexWaitv::ETIMEDOUT | FutexWaitv::ECANCELED) => WaitResult::Timeout,
             Err(FutexWaitv::ERESTARTSYS) => WaitResult::Restart,
             Err(errno) => return Err(std::io::Error::from_raw_os_error(errno)),
             Ok(_) => WaitResult::Error,
-        })
+        };
+
+        let loaded = assertion.load(atomic::Ordering::Acquire);
+        let awaited = ServerAwaited { bumped: loaded };
+        Ok((status, awaited))
+    }
+
+    pub async fn ack_server(
+        &self,
+        server: &Server,
+        awaitable: ServerAwaited,
+    ) -> Result<u32, std::io::Error> {
+        let head = server.head();
+        let pong = &head.ring_ping.ring_pong.0;
+        // TODO: use FUTEX_WAKE_OP to make this atomic?
+        pong.store(awaitable.bumped, atomic::Ordering::Release);
+
+        let key = self.establish_notice();
+        let submit = self.non_empty_submission_and_then_sync(1).await?;
+
+        let wakes = opcode::FutexWake::new(
+            pong.as_ptr(),
+            // Wakeup everyone.
+            FUTEX_WAKE_MAX,
+            u32::MAX.into(),
+            // On this 32-bit futex.
+            FutexWaitv::ATOMIC_U32,
+        )
+        .build()
+        .user_data(key.as_user_data());
+
+        unsafe { submit.redeem_push(&[wakes], []) };
+        match key.wait().await {
+            Ok(n) => Ok(n as u32),
+            Err(errno) => Err(std::io::Error::from_raw_os_error(errno)),
+        }
     }
 
     // We do not implement `activate` here, which is a single futex wake call, since semantics of
@@ -598,7 +656,7 @@ impl ShmIoUring {
         let entry_head = opcode::FutexWake::new(
             producer,
             // Wakeup everyone.
-            u32::MAX.into(),
+            FUTEX_WAKE_MAX,
             u32::MAX.into(),
             // On this 32-bit futex.
             FutexWaitv::ATOMIC_U32,
@@ -611,7 +669,7 @@ impl ShmIoUring {
         let entry_blocked = opcode::FutexWake::new(
             producer,
             // Wakeup everyone.
-            u32::MAX.into(),
+            FUTEX_WAKE_MAX,
             u32::MAX.into(),
             // On this 32-bit futex.
             FutexWaitv::ATOMIC_U32,

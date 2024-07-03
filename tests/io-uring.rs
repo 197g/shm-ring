@@ -32,7 +32,7 @@ async fn sync_rings() {
 
     let shared_server = shared.clone();
     let server = unsafe { shared_server.into_server(ServerConfig { vec: &rings }) };
-    let _server = server.expect("Have initialized server");
+    let server = server.expect("Have initialized server");
 
     let shared_client = shared.clone().into_client();
     let client = shared_client.expect("Have initialized client");
@@ -59,6 +59,31 @@ async fn sync_rings() {
         ring.is_supported().expect("Probing works").any(),
         "Your OS does not support the Futex operations required"
     );
+
+    eprintln!("Awake and notify");
+    let woken_lhs = lhs.awaitable();
+    let woken_rhs = rhs.awaitable();
+
+    let (ready_lhs, ready_rhs, ()) = tokio::try_join!(
+        ring.wait_client(&client, woken_lhs, Duration::from_millis(1_000)),
+        ring.wait_client(&client, woken_rhs, Duration::from_millis(1_000)),
+        async {
+            let (ready_server, awaitable) = ring
+                .wait_server(&server, Duration::from_millis(1_000))
+                .await?;
+            assert!(matches!(ready_server, WaitResult::Ok));
+            assert_eq!(awaitable.bumped, 2);
+
+            eprintln!("Server will bump to: {}", awaitable.bumped);
+            let n = ring.ack_server(&server, awaitable).await?;
+            eprintln!("Server bumped {n} clients");
+            Ok(())
+        }
+    )
+    .unwrap();
+
+    assert!(matches!(ready_lhs, WaitResult::Ok), "{ready_lhs:?}");
+    assert!(matches!(ready_rhs, WaitResult::Ok), "{ready_rhs:?}");
 
     eprintln!("Sending message");
     let (locked, woken) = tokio::join!(

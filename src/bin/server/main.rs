@@ -184,9 +184,9 @@ async fn serve_map_in(shared: Shared, options: Options) -> Result<(), ServerServ
     let (reap_send, mut reaper) = tokio::sync::mpsc::channel::<TrackedClient>(0x1);
 
     loop {
-        tokio::select! {
+        let next_server_state = tokio::select! {
             waiter = uring.wait_server(&server, duration) => {
-                let _ = waiter.map_err(ServeIoUring)?;
+                Some(waiter.map_err(ServeIoUring)?)
             }
             client = reaper.recv() => {
                 let Some(client) = client else {
@@ -195,8 +195,9 @@ async fn serve_map_in(shared: Shared, options: Options) -> Result<(), ServerServ
 
                 eprintln!("Reaped dead client pid {:?}", client.identifier());
                 server.reap_client(&mut task, client);
+                None
             }
-        }
+        };
 
         for client in server.track_clients(&mut task) {
             let reap_send = reap_send.clone();
@@ -219,7 +220,12 @@ async fn serve_map_in(shared: Shared, options: Options) -> Result<(), ServerServ
             }
         }
 
-        std::hint::spin_loop();
+        if let Some(next_server_state) = next_server_state {
+            uring.ack_server(&server, next_server_state).await?;
+        } else {
+            std::hint::spin_loop();
+        }
+
         std::thread::yield_now();
     }
 

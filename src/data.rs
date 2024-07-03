@@ -13,7 +13,14 @@ pub struct ShmHead {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ClientAwaitable {
+    pub bumped: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ServerAwaited {
     pub bumped: u32,
 }
 
