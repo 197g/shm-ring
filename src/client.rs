@@ -539,10 +539,10 @@ impl OwnedRingSlot {
         // one side must take at a time and which can be stolen when the whole ring is going to be
         // shut down).
         let owner = (!self.side).as_block_slot();
-        let Ok(_n_waiters_moved) = slot.cmp_requeue(owner, 0, producer, i32::MAX) else {
+
+        if let Err(_) = slot.cmp_requeue(owner, 0, producer, i32::MAX) {
             // Oh, the lock wasn't actually taken. Obviously if we'd have taken the lock then we
             // wouldn't be running in this. Right?
-            return 0;
         };
 
         producer.wake(i32::MAX) as u32

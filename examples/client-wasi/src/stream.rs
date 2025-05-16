@@ -118,7 +118,7 @@ impl InputRing {
 
         // Time between gratuitous runs of the loop, which might be needed to retry the release of
         // acknowledgements when those are consumed slowly.
-        let recheck_time = core::time::Duration::from_millis(10);
+        let recheck_time = core::time::Duration::from_micros(1_000);
         let hdl = inner.clone();
 
         let _task = local.spawn_local(async move {
@@ -139,6 +139,7 @@ impl InputRing {
 
                 // 2. wait for messages on the ring.
                 let mut reap = ring.consumer::<8>().unwrap();
+                let previous_head = available.0;
 
                 available.extend(
                     reap.iter()
@@ -171,8 +172,14 @@ impl InputRing {
                     }
 
                     produce.sync();
-                    ring.wake();
                 }
+
+                if available.0 != previous_head {
+                    // Avoid waiting and syncing if we indeed received more data.
+                    continue;
+                }
+
+                ring.wake();
 
                 let wait = match on.wait_for_message(&ring, head_receive, recheck_time).await {
                     Err(io) => break Err(io),
@@ -306,7 +313,7 @@ impl OutputRing {
 
         // Time between gratuitous runs of the loop, which might be needed to retry the release of
         // acknowledgements when those are consumed slowly.
-        let recheck_time = core::time::Duration::from_millis(10);
+        let recheck_time = core::time::Duration::from_micros(1_000);
         let hdl = inner.clone();
 
         local.spawn_local(async move {
@@ -322,15 +329,24 @@ impl OutputRing {
 
             let mut outstanding_flush = 0;
             let mut recheck = tokio::time::interval(recheck_time);
+            let mut ready = core::future::ready(());
+            let mut immediate = true;
 
             loop {
                 // 1. wait for data having been produced.
+                //
+                // FIXME: all the while doing this we may as well check with the ring, right? So we
+                // should also accept a wait message here; but since that may fail and itself be
+                // overhead we might sometimes just want to check as a loop?
                 tokio::select! {
                     _ = more_data, if !is_eof => {},
-                    // FIXME: when we flush, we wait this tick time to find out if the remote has
+                    // FIXME: when we flush, we wait one tick time to find out if the remote has
                     // accepted the data. This is quite wasteful.
                     _ = recheck.tick() => {},
+                    _ = ready, if immediate => {}
                 };
+
+                ready = core::future::ready(());
 
                 // eprintln!("Can send {released}/{sequence}/{outstanding_flush}");
                 let mut reap = ring.consumer::<8>().unwrap();
@@ -353,6 +369,7 @@ impl OutputRing {
                     break;
                 }
 
+                let previous_seq = sequence;
                 // Write more data if we're not instructed to flush.
                 outstanding_flush = if outstanding_flush == 0 && !is_eof {
                     // Re-arm the notify while holding the guard, ensure nothing is lost.
@@ -377,8 +394,11 @@ impl OutputRing {
                     }
 
                     produce.sync();
-                    ring.wake();
                     hdl.notify_written.notify_waiters();
+                }
+
+                if previous_seq == sequence {
+                    ring.wake();
                 }
 
                 hdl.bytes_written.store(released, atomic::Ordering::Relaxed);
@@ -397,6 +417,10 @@ impl OutputRing {
                     eprintln!("End at {released}/{sequence}/{outstanding_flush}");
                 } */
 
+                // If we have written anything, don't try to wait by some kind of barrier. Just go
+                // again, immediately. We could also do a kind of counting mechanism where we go
+                // for n steps immediately just to try to push new data.
+                immediate = previous_seq != sequence;
                 tokio::task::yield_now().await;
             }
         });
