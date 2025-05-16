@@ -277,8 +277,7 @@ impl ShmIoUring {
         // Safety: we're owning the ring, which the block references. This keeps it alive for as
         // long as this futex wait is in the kernel, i.e. until everything was reaped. If we can't,
         // the Arc is leaked thus keeping the io-uring itself alive with the memory mapping.
-        *fblock =
-            unsafe { FutexWaitv::from_u32_unchecked(assertion.block(), assertion.owner()) };
+        *fblock = unsafe { FutexWaitv::from_u32_unchecked(assertion.block(), assertion.owner()) };
 
         let key = self.establish_notice();
         let entry = opcode::FutexWaitV::new(Rc::as_ptr(&wakes) as *const _, 1)
@@ -318,6 +317,14 @@ impl ShmIoUring {
 
         let rhead = ring.ring_head();
         let side = ring.side();
+
+        if rhead.send_indicator(!side).load(atomic::Ordering::Relaxed) != 1 {
+            return Ok(WaitResult::RemoteInactive);
+        }
+
+        if rhead.blocked.0.load(atomic::Ordering::Relaxed) != 0 {
+            return Ok(WaitResult::RemoteInactive);
+        }
 
         let mut wakes = Rc::new([(); 3].map(|_| FutexWaitv::pending()));
         let [fblock, fsend, fhead] = Rc::get_mut(&mut wakes).unwrap();

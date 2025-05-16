@@ -224,11 +224,17 @@ fn join_ring(
 ) -> Result<Option<Ring>, RingJoinError> {
     options
         .map(|opt| {
-            client.join(&RingRequest {
+            let mut ring = client.join(&RingRequest {
                 index: RingIndex(opt.index),
                 side: opt.side,
                 tid,
-            })
+            });
+
+            if let Ok(ring) = &mut ring {
+                ring.activate();
+            }
+
+            ring
         })
         .transpose()
 }
@@ -253,7 +259,7 @@ impl wasmtime_wasi::StdinStream for Stdin {
 
 impl wasmtime_wasi::StdoutStream for Stdout {
     fn stream(&self) -> Box<dyn wasmtime_wasi::HostOutputStream> {
-        Box::new(self.inner.clone())
+        Box::new(self.inner.stream())
     }
 
     fn isatty(&self) -> bool {
@@ -357,13 +363,19 @@ async fn move_stdin(
     use tokio::io::AsyncBufReadExt as _;
     use wasmtime_wasi::HostOutputStream as _;
 
-    let mut proxy = stream::OutputRing::new(ring, uring.clone(), &local);
+    let proxy = stream::OutputRing::new(ring, uring.clone(), &local);
+    let mut proxy = proxy.stream();
+
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
 
     const SIZE: usize = 1 << 12;
 
     loop {
         let buf = stdin.fill_buf().await.map_err(ClientIoUring)?;
+
+        if buf.is_empty() {
+            break;
+        }
 
         let write = match proxy.check_write() {
             Ok(n) => buf.len().min(n).min(SIZE),

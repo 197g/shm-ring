@@ -424,6 +424,15 @@ impl Ring {
     /// - The head of the list is changed, with the other side waking waiters.
     /// - The timeout is reached.
     pub fn wait_for_message(&self, head: u32, timeout: time::Duration) -> WaitResult {
+        if self.map.remote_indicator().load(atomic::Ordering::Relaxed) != 1 {
+            return WaitResult::RemoteInactive;
+        }
+
+        let blocking = &self.map.ring_slot.head.blocked.0;
+        if blocking.load(atomic::Ordering::Relaxed) != 0 {
+            return WaitResult::RemoteInactive;
+        }
+
         let mut wakes = [(); 3].map(|_| uapi::FutexWaitv::pending());
         let [fblock, fsend, fhead] = &mut wakes;
 
@@ -458,6 +467,12 @@ impl Ring {
 
     pub(crate) fn side(&self) -> data::ClientSide {
         self.map.ring_slot.side
+    }
+}
+
+impl Drop for Ring {
+    fn drop(&mut self) {
+        self.deactivate();
     }
 }
 
