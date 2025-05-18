@@ -12,7 +12,7 @@ use serde::Deserialize;
 use wasmtime::{Instance, Module, Store};
 use wasmtime_wasi::{preview1, WasiCtxBuilder};
 
-use std::{fs, path::PathBuf, sync};
+use std::{fs, path::PathBuf, rc, sync};
 
 #[derive(Deserialize)]
 struct Options {
@@ -137,14 +137,18 @@ fn main() -> Result<(), Error> {
     let client = shared.into_client().expect("Have initialized client");
 
     let tid = ClientIdentifier::new();
-    let mod_options = &options.modules[0];
 
     let mut config = wasmtime::Config::new();
     config.async_support(true);
     config.consume_fuel(true);
     let engine = wasmtime::Engine::new(&config)?;
 
-    let program = new_program(&engine, &mod_options, &client, tid, opt_path.to_path_buf())?;
+    let programs = options
+        .modules
+        .iter()
+        .map(|mod_options| new_program(&engine, &mod_options, &client, tid, opt_path.to_path_buf()))
+        .collect::<Result<Vec<_>, _>>()?;
+
     let host = host(&options, &client, tid)?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -156,18 +160,32 @@ fn main() -> Result<(), Error> {
     rt.block_on(async {
         let local = tokio::task::LocalSet::new();
 
-        let uring = ShmIoUring::new(&shared).map_err(ClientIoUring)?;
-        let uring = sync::Arc::new(uring);
+        for program in programs {
+            let shared = shared.clone();
 
-        let (store, instance) = instantiate(uring.clone(), program, &local).await?;
-        let host = communicate_host(uring.clone(), host, &local);
-        let client = communicate(store, instance);
+            // If we could we might run this transparently on another thread. But this can not move
+            // after its creation. It is not `Send` due to the uring and localset being alive
+            // across await points. Therefore to realize such a system we need to spawn a dedicated
+            // thread and send the task description to it.
+            let run_module = async move {
+                let shared = shared;
+                let local = tokio::task::LocalSet::new();
+                let uring = rc::Rc::new(ShmIoUring::new(&shared).map_err(ClientIoUring)?);
+
+                let (store, instance) = instantiate(uring.clone(), program, &local).await?;
+                local.run_until(communicate(store, instance)).await?;
+
+                Ok::<_, ClientRunError>(())
+            };
+
+            local.spawn_local(run_module);
+        }
+
+        let uring = rc::Rc::new(ShmIoUring::new(&shared).map_err(ClientIoUring)?);
+        let host = communicate_host(uring, host, &local);
 
         now = std::time::Instant::now();
-
-        local
-            .run_until(async move { tokio::try_join!(host, client,) })
-            .await?;
+        local.run_until(host).await?;
 
         Ok::<_, ClientRunError>(())
     })?;
@@ -273,7 +291,7 @@ impl wasmtime_wasi::StdoutStream for Stdout {
 }
 
 async fn instantiate(
-    uring: sync::Arc<ShmIoUring>,
+    uring: rc::Rc<ShmIoUring>,
     program: Program,
     local: &tokio::task::LocalSet,
 ) -> Result<(Store<ModuleP1Data>, Instance), ClientRunError> {
@@ -343,7 +361,7 @@ async fn communicate(
 }
 
 async fn communicate_host(
-    uring: sync::Arc<ShmIoUring>,
+    uring: rc::Rc<ShmIoUring>,
     host: Host,
     local: &tokio::task::LocalSet,
 ) -> Result<(), ClientRunError> {
@@ -368,7 +386,7 @@ async fn communicate_host(
 }
 
 async fn move_stdin(
-    uring: sync::Arc<ShmIoUring>,
+    uring: rc::Rc<ShmIoUring>,
     ring: Ring,
     local: &tokio::task::LocalSet,
 ) -> Result<(), ClientRunError> {
@@ -420,7 +438,7 @@ async fn move_stdin(
 }
 
 async fn move_stdout(
-    uring: sync::Arc<ShmIoUring>,
+    uring: rc::Rc<ShmIoUring>,
     ring: Ring,
     local: &tokio::task::LocalSet,
 ) -> Result<(), ClientRunError> {

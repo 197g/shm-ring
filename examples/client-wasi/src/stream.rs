@@ -2,6 +2,7 @@ use std::{
     collections::VecDeque,
     ops::Range,
     sync::{atomic, Arc, Mutex},
+    rc::Rc,
 };
 
 use crate::notify::{CloseableNotifyReader, CloseableNotifyWriter};
@@ -35,9 +36,6 @@ pub struct OutputRing {
     name: Option<u64>,
     #[expect(dead_code)]
     notify_produced: CloseableNotifyWriter,
-    /// The owner to [`OutputInner::open`].
-    #[expect(dead_code)]
-    open: Arc<()>,
 }
 
 pub struct OutputStream {
@@ -106,7 +104,7 @@ fn split_ring(available: &Range<&mut u64>, buffer_space_size: u64) -> (Range<usi
 }
 
 impl InputRing {
-    pub fn new(mut ring: Ring, io: Arc<ShmIoUring>, local: &tokio::task::LocalSet) -> Self {
+    pub fn new(mut ring: Ring, io: Rc<ShmIoUring>, local: &tokio::task::LocalSet) -> Self {
         let buffer_space_size = usable_power_of_two_size(&ring);
         let (notify_produced_w, notify_produced) = CloseableNotifyWriter::new();
 
@@ -306,9 +304,8 @@ impl Drop for NoMore {
 }
 
 impl OutputRing {
-    pub fn new(mut ring: Ring, io: Arc<ShmIoUring>, local: &tokio::task::LocalSet) -> Self {
+    pub fn new(mut ring: Ring, io: Rc<ShmIoUring>, local: &tokio::task::LocalSet) -> Self {
         let buffer_space_size = usable_power_of_two_size(&ring);
-        let open = Arc::new(());
 
         let (notify_produced_w, notify_produced) = CloseableNotifyWriter::new();
         let (notify_written_w, notify_written) = CloseableNotifyWriter::new();
@@ -452,7 +449,6 @@ impl OutputRing {
         OutputRing {
             inner,
             notify_produced: notify_produced_w,
-            open,
             name: None,
         }
     }
