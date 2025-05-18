@@ -1,16 +1,16 @@
+mod notify;
 mod stream;
 
-use shm_pbx::client::{Client, Ring, RingJoinError, RingRequest, WaitResult};
+use shm_pbx::client::{Client, Ring, RingJoinError, RingRequest};
 use shm_pbx::data::{ClientIdentifier, ClientSide, RingIndex};
 use shm_pbx::frame::Shared;
 use shm_pbx::io_uring::ShmIoUring;
-use shm_pbx::server::{RingConfig, RingVersion, ServerConfig};
 
 use memmap2::MmapRaw;
 use quick_error::quick_error;
 use serde::Deserialize;
-use wasmtime::{Module, Store};
-use wasmtime_wasi::{preview1, ResourceTable, WasiCtx, WasiCtxBuilder};
+use wasmtime::{Instance, Module, Store};
+use wasmtime_wasi::{preview1, WasiCtxBuilder};
 
 use std::{fs, path::PathBuf, sync};
 
@@ -145,7 +145,6 @@ fn main() -> Result<(), Error> {
     let engine = wasmtime::Engine::new(&config)?;
 
     let program = new_program(&engine, &mod_options, &client, tid, opt_path.to_path_buf())?;
-
     let host = host(&options, &client, tid)?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -153,14 +152,18 @@ fn main() -> Result<(), Error> {
         .enable_time()
         .build()?;
 
+    let mut now = std::time::Instant::now();
     rt.block_on(async {
         let local = tokio::task::LocalSet::new();
 
         let uring = ShmIoUring::new(&shared).map_err(ClientIoUring)?;
         let uring = sync::Arc::new(uring);
 
+        let (store, instance) = instantiate(uring.clone(), program, &local).await?;
         let host = communicate_host(uring.clone(), host, &local);
-        let client = communicate(uring.clone(), program, &local);
+        let client = communicate(store, instance);
+
+        now = std::time::Instant::now();
 
         local
             .run_until(async move { tokio::try_join!(host, client,) })
@@ -168,6 +171,8 @@ fn main() -> Result<(), Error> {
 
         Ok::<_, ClientRunError>(())
     })?;
+
+    eprintln!("Time elapsed: {}ms", now.elapsed().as_millis());
 
     Ok(())
 }
@@ -267,11 +272,11 @@ impl wasmtime_wasi::StdoutStream for Stdout {
     }
 }
 
-async fn communicate(
+async fn instantiate(
     uring: sync::Arc<ShmIoUring>,
     program: Program,
     local: &tokio::task::LocalSet,
-) -> Result<(), ClientRunError> {
+) -> Result<(Store<ModuleP1Data>, Instance), ClientRunError> {
     let main = ModuleP1Data {
         ctx: {
             let mut ctx = WasiCtxBuilder::new();
@@ -319,9 +324,16 @@ async fn communicate(
         .instantiate_async(&mut store, &program.module)
         .await?;
 
+    Ok((store, instance))
+}
+
+async fn communicate(
+    mut store: Store<ModuleP1Data>,
+    instance: Instance,
+) -> Result<(), ClientRunError> {
     let main = instance.get_typed_func::<(), ()>(&mut store, "_start")?;
 
-    const FUEL: u64 = 1 << 12;
+    const FUEL: u64 = 1 << 18;
     store.fuel_async_yield_interval(Some(FUEL))?;
     store.set_fuel(u64::MAX)?;
 
@@ -416,7 +428,8 @@ async fn move_stdout(
     use wasmtime_wasi::{HostInputStream as _, Subscribe};
 
     let mut proxy = stream::InputRing::new(ring, uring.clone(), &local);
-    let mut stdout = tokio::io::stdout();
+    let mut stdout = tokio::io::BufWriter::new(tokio::io::stdout());
+
     const SIZE: usize = 1 << 12;
 
     loop {
@@ -427,11 +440,16 @@ async fn move_stdout(
                 continue;
             }
             Err(wasmtime_wasi::StreamError::Closed) => break,
-            Err(_err) => panic!(),
+            Err(err) => {
+                eprintln!("{err:?}");
+                panic!()
+            }
         };
 
         stdout.write_all(&bytes).await.map_err(ClientIoUring)?;
     }
+
+    stdout.flush().await.map_err(ClientIoUring)?;
 
     Ok(())
 }

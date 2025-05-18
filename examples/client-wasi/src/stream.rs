@@ -1,13 +1,15 @@
 use std::{
     collections::VecDeque,
     ops::Range,
-    sync::{atomic, Arc, Mutex, Weak},
+    sync::{atomic, Arc, Mutex},
 };
+
+use crate::notify::{CloseableNotifyReader, CloseableNotifyWriter};
 
 use bytes::Bytes;
 use shm_pbx::client::{Ring, WaitResult};
 use shm_pbx::io_uring::ShmIoUring;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Semaphore;
 use wasmtime_wasi::{HostInputStream, HostOutputStream, StreamResult, Subscribe};
 
 #[derive(Clone)]
@@ -17,21 +19,22 @@ pub struct InputRing {
 }
 
 struct InputInner {
-    notify_produced: Notify,
-    notify_consumed: Semaphore,
-    buffer: Mutex<VecDeque<Bytes>>,
-    buffer_space_size: u64,
     /// Signals if the file is closed. Only the file itself has strong ownership, while streams
     /// merely hold it open while they are using the fd. When there are no more strong owners, the
     /// worker in the background can exit as soon as it consumed everything.
     ///
     /// The owner to this is the reader loop.
-    open: Weak<()>,
+    notify_produced: CloseableNotifyReader,
+    available_space: Semaphore,
+    buffer: Mutex<VecDeque<Bytes>>,
+    buffer_space_size: u64,
 }
 
 pub struct OutputRing {
     inner: Arc<OutputInner>,
     name: Option<u64>,
+    #[expect(dead_code)]
+    notify_produced: CloseableNotifyWriter,
     /// The owner to [`OutputInner::open`].
     #[expect(dead_code)]
     open: Arc<()>,
@@ -46,9 +49,8 @@ struct OutputInner {
     /// Signals if the file is closed. Only the file itself has strong ownership, while streams
     /// merely hold it open while they are using the fd. When there are no more strong owners, the
     /// worker in the background can exit as soon as it consumed everything.
-    open: Weak<()>,
-    notify_produced: Notify,
-    notify_written: Notify,
+    notify_produced: CloseableNotifyReader,
+    notify_written: CloseableNotifyReader,
     buffer: Mutex<VecDeque<Bytes>>,
     flush_level: atomic::AtomicUsize,
     flushed: atomic::AtomicUsize,
@@ -104,14 +106,13 @@ fn split_ring(available: &Range<&mut u64>, buffer_space_size: u64) -> (Range<usi
 }
 
 impl InputRing {
-    pub fn new(mut ring: Ring, on: Arc<ShmIoUring>, local: &tokio::task::LocalSet) -> Self {
+    pub fn new(mut ring: Ring, io: Arc<ShmIoUring>, local: &tokio::task::LocalSet) -> Self {
         let buffer_space_size = usable_power_of_two_size(&ring);
-        let open = Arc::new(());
+        let (notify_produced_w, notify_produced) = CloseableNotifyWriter::new();
 
         let inner = Arc::new(InputInner {
-            open: Arc::downgrade(&open),
-            notify_produced: Notify::new(),
-            notify_consumed: Semaphore::const_new(32),
+            notify_produced,
+            available_space: Semaphore::const_new(32),
             buffer: Mutex::default(),
             buffer_space_size,
         });
@@ -122,22 +123,57 @@ impl InputRing {
         let hdl = inner.clone();
 
         let _task = local.spawn_local(async move {
+            let io = io;
+
             let mut available = Available(0u64);
             let mut sequence = 0u64;
             let mut released = 0u64;
             let mut head_receive = 0;
 
-            let open = open;
+            let notify_produced = notify_produced_w;
+            let mut ready = core::future::ready(());
+            let mut is_eof = false;
+            let mut permit = None;
+            let mut likely_get_more_data = true;
 
-            let result = loop {
-                // 1. wait for space on the queue. FIXME: potentially losing the last message. At
+            loop {
+                // 1. wait for the next action. FIXME: potentially losing the last message. At
                 //    `RemoteInactive` we break before having cleaned up. Should fence post with a
                 //    last consumer and consume_stream round.
-                let Ok(permit) = hdl.notify_consumed.acquire().await else {
-                    break Ok(());
-                };
+                tokio::select! {
+                    acq = hdl.available_space.acquire(), if permit.is_none() => {
+                        match acq {
+                            Err(_) => return Ok(()),
+                            Ok(acq) => permit = Some(acq),
+                        }
+                    }
+                    wait = io.indicate_for_message(&ring, head_receive, 5 * recheck_time), if permit.is_some() && !likely_get_more_data => {
+                        let wait = match wait {
+                            Err(io) => return Err(io),
+                            Ok(wait) => wait,
+                        };
 
-                // 2. wait for messages on the ring.
+                        match wait {
+                            // We successfully waited, or the other half had concurrently advanced anyways
+                            WaitResult::Ok | WaitResult::PreconditionFailed => {}
+                            // Also alright, nothing fatal and just retry. Could handle blocked a bit
+                            // nicer.
+                            WaitResult::RemoteBlocked | WaitResult::Restart | WaitResult::Timeout => {}
+                            // The remote is no longer here. We stop as soon as we processed all their
+                            // data which causes this loop to be longer needed. RAII does all the lifting
+                            // of notifying the clients and closing the FD.
+                            WaitResult::RemoteInactive => {
+                                is_eof = true;
+                            }
+                            WaitResult::Error => unreachable!(""),
+                        }
+                    }
+                    _ = ready, if permit.is_some() && likely_get_more_data => {}
+                }
+
+                ready = core::future::ready(());
+
+                // 2. check for messages on the ring.
                 let mut reap = ring.consumer::<8>().unwrap();
                 let previous_head = available.0;
 
@@ -149,7 +185,8 @@ impl InputRing {
 
                 reap.sync();
 
-                {
+                // Do we have the opportunity to read out data?
+                if let Some(slot) = permit.take() {
                     let mut guard = hdl.buffer.lock().unwrap();
                     let range = (&mut sequence)..(&mut available.0);
                     let data = Self::consume_stream(&hdl, range, &ring);
@@ -157,10 +194,16 @@ impl InputRing {
                     if !data.is_empty() {
                         guard.push_back(data);
 
-                        hdl.notify_produced.notify_waiters();
+                        notify_produced.notify_waiters();
                         // Permit is restored by the consumer of these bytes.
-                        permit.forget();
+                        slot.forget();
+                    } else {
+                        permit = Some(slot);
                     }
+                }
+
+                if is_eof && sequence == available.0 {
+                    return Ok(());
                 }
 
                 // Acknowledge the receipt, free buffer space.
@@ -174,38 +217,12 @@ impl InputRing {
                     produce.sync();
                 }
 
-                if available.0 != previous_head {
-                    // Avoid waiting and syncing if we indeed received more data.
-                    continue;
+                // Avoid waiting and syncing if we indeed received more data.
+                likely_get_more_data = available.0 != previous_head;
+                if let Ok(1..) = io.wake_indicated(&ring).await {
+                    {}
                 }
-
-                ring.wake();
-
-                let wait = match on.wait_for_message(&ring, head_receive, recheck_time).await {
-                    Err(io) => break Err(io),
-                    Ok(wait) => wait,
-                };
-
-                match wait {
-                    // We successfully waited, or the other half had concurrently advanced anyways
-                    WaitResult::Ok | WaitResult::PreconditionFailed => {}
-                    // Also alright, nothing fatal and just retry. Could handle blocked a bit
-                    // nicer.
-                    WaitResult::RemoteBlocked | WaitResult::Restart | WaitResult::Timeout => {}
-                    // The remote is no longer here. We stop as soon as we processed all their
-                    // data but this loop is no longer needed.
-                    WaitResult::RemoteInactive => {
-                        hdl.notify_consumed.close();
-                        continue;
-                    }
-                    WaitResult::Error => unreachable!(""),
-                }
-            };
-
-            drop(open);
-            hdl.notify_produced.notify_waiters();
-
-            result
+            }
         });
 
         InputRing { inner, name: None }
@@ -241,7 +258,7 @@ impl HostInputStream for InputRing {
 
         let mut guard = self.inner.buffer.lock().unwrap();
         let Some(bytes) = guard.front_mut() else {
-            return if self.inner.open.upgrade().is_some() {
+            return if !self.inner.notify_produced.is_closed() {
                 Ok(Bytes::default())
             } else {
                 Err(wasmtime_wasi::StreamError::Closed)
@@ -253,7 +270,7 @@ impl HostInputStream for InputRing {
 
         if bytes.is_empty() {
             let _ = guard.pop_front();
-            self.inner.notify_consumed.add_permits(1);
+            self.inner.available_space.add_permits(1);
         }
 
         Ok(value)
@@ -267,12 +284,6 @@ impl Subscribe for InputRing {
             eprintln!("{name}: Wait");
         }
 
-        let Some(_streamops) = self.inner.open.upgrade() else {
-            return;
-        };
-
-        // FIXME: a race between that notification and dropping the streamops thing.
-        // We're ready to receive notifications after this point.
         let wakeup = self.inner.notify_produced.notified();
 
         {
@@ -282,7 +293,7 @@ impl Subscribe for InputRing {
             }
         }
 
-        wakeup.await
+        let _ = wakeup.await;
     }
 }
 
@@ -299,10 +310,12 @@ impl OutputRing {
         let buffer_space_size = usable_power_of_two_size(&ring);
         let open = Arc::new(());
 
+        let (notify_produced_w, notify_produced) = CloseableNotifyWriter::new();
+        let (notify_written_w, notify_written) = CloseableNotifyWriter::new();
+
         let inner = Arc::new(OutputInner {
-            open: Arc::downgrade(&open),
-            notify_produced: Notify::new(),
-            notify_written: Notify::new(),
+            notify_produced: notify_produced.clone(),
+            notify_written,
             buffer: Mutex::default(),
             flush_level: 0.into(),
             flushed: 0.into(),
@@ -313,13 +326,13 @@ impl OutputRing {
 
         // Time between gratuitous runs of the loop, which might be needed to retry the release of
         // acknowledgements when those are consumed slowly.
-        let recheck_time = core::time::Duration::from_micros(1_000);
+        let recheck_time = core::time::Duration::from_micros(500);
         let hdl = inner.clone();
 
         local.spawn_local(async move {
-            let _io = io;
+            let io = io;
 
-            let mut more_data = hdl.notify_produced.notified();
+            let mut more_data = notify_produced.notified();
             let mut available = Available(buffer_space_size);
 
             let mut sequence = 0u64;
@@ -331,25 +344,28 @@ impl OutputRing {
             let mut recheck = tokio::time::interval(recheck_time);
             let mut ready = core::future::ready(());
             let mut immediate = true;
+            let mut likely_get_more_data = true;
+
+            let mut no_more_messages = true;
 
             loop {
-                // 1. wait for data having been produced.
-                //
-                // FIXME: all the while doing this we may as well check with the ring, right? So we
-                // should also accept a wait message here; but since that may fail and itself be
-                // overhead we might sometimes just want to check as a loop?
+                // 1. wait for some data having been produced, by our feed or the remote. Also we
+                //    just do ticks sometimes to make sure and sometimes do not wait at all.
                 tokio::select! {
-                    _ = more_data, if !is_eof => {},
-                    // FIXME: when we flush, we wait one tick time to find out if the remote has
-                    // accepted the data. This is quite wasteful.
                     _ = recheck.tick() => {},
-                    _ = ready, if immediate => {}
+                    _ = more_data, if no_more_messages => {},
+                    _ = ready, if immediate || likely_get_more_data || !no_more_messages => {}
+                    wait = io.indicate_for_message(&ring, head_receive, 5 * recheck_time), if !likely_get_more_data => { 
+                        // FIXME: handle wait, particular exit.
+                    }
                 };
 
+                // Re-ready the immediate.
                 ready = core::future::ready(());
 
                 // eprintln!("Can send {released}/{sequence}/{outstanding_flush}");
                 let mut reap = ring.consumer::<8>().unwrap();
+                let previous_ack = available.0;
 
                 available.extend(
                     reap.iter()
@@ -359,6 +375,7 @@ impl OutputRing {
                 );
 
                 reap.sync();
+                likely_get_more_data = previous_ack != available.0;
 
                 if outstanding_flush == 0
                     && is_eof
@@ -370,21 +387,24 @@ impl OutputRing {
                 }
 
                 let previous_seq = sequence;
+
                 // Write more data if we're not instructed to flush.
                 outstanding_flush = if outstanding_flush == 0 && !is_eof {
                     // Re-arm the notify while holding the guard, ensure nothing is lost.
                     let mut guard = hdl.buffer.lock().unwrap();
-                    more_data = hdl.notify_produced.notified();
+                    more_data = notify_produced.notified();
                     let range = (&mut sequence)..(&mut available.0);
                     let flush = Self::fill_stream(&hdl, range, &mut guard, &ring);
+                    no_more_messages = guard.is_empty();
                     flush
                 // If we've successfully flushed, tell the writer.
                 } else {
-                    more_data = hdl.notify_produced.notified();
+                    more_data = notify_produced.notified();
+                    no_more_messages = false;
                     outstanding_flush
                 };
 
-                is_eof |= hdl.open.strong_count() == 0;
+                is_eof |= no_more_messages && notify_produced.is_closed();
 
                 if sequence != released {
                     let mut produce = ring.producer::<8>().unwrap();
@@ -394,21 +414,25 @@ impl OutputRing {
                     }
 
                     produce.sync();
-                    hdl.notify_written.notify_waiters();
+
+                    hdl.bytes_written.store(released, atomic::Ordering::Relaxed);
+                    if sequence == released {
+                        notify_written_w.notify_waiters();
+                    }
                 }
 
-                if previous_seq == sequence {
-                    ring.wake();
+                if released > available.0 - buffer_space_size {
+                    if let Ok(1..) = io.wake_indicated(&ring).await {
+                        {}
+                    }
                 }
-
-                hdl.bytes_written.store(released, atomic::Ordering::Relaxed);
 
                 if outstanding_flush > 0 && released == sequence {
                     hdl.flushed
                         .fetch_add(outstanding_flush, atomic::Ordering::Release);
-                    hdl.notify_written.notify_waiters();
+                    notify_written_w.notify_waiters();
 
-                    more_data = hdl.notify_produced.notified();
+                    more_data = notify_produced.notified();
                     outstanding_flush = 0;
                 }
 
@@ -427,6 +451,7 @@ impl OutputRing {
 
         OutputRing {
             inner,
+            notify_produced: notify_produced_w,
             open,
             name: None,
         }
@@ -493,7 +518,7 @@ impl OutputRing {
 
 impl HostOutputStream for OutputStream {
     fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
-        let Some(_streamops) = self.inner.open.upgrade() else {
+        let Some(notify_produced) = self.inner.notify_produced.upgrade() else {
             return Err(wasmtime_wasi::StreamError::Closed);
         };
 
@@ -514,12 +539,12 @@ impl HostOutputStream for OutputStream {
             guard.push_back(bytes);
         }
 
-        self.inner.notify_produced.notify_waiters();
+        notify_produced.notify_waiters();
         Ok(())
     }
 
     fn flush(&mut self) -> StreamResult<()> {
-        let Some(_streamops) = self.inner.open.upgrade() else {
+        let Some(notify_produced) = self.inner.notify_produced.upgrade() else {
             return Err(wasmtime_wasi::StreamError::Closed);
         };
 
@@ -536,12 +561,12 @@ impl HostOutputStream for OutputStream {
             guard.push_back(Bytes::default());
         }
 
-        self.inner.notify_produced.notify_waiters();
+        notify_produced.notify_waiters();
         Ok(())
     }
 
     fn check_write(&mut self) -> StreamResult<usize> {
-        let Some(_streamops) = self.inner.open.upgrade() else {
+        if self.inner.notify_produced.is_closed() {
             return Err(wasmtime_wasi::StreamError::Closed);
         };
 
@@ -579,7 +604,7 @@ impl OutputInner {
 #[wasmtime_wasi::async_trait]
 impl Subscribe for OutputStream {
     async fn ready(&mut self) {
-        let Some(_streamops) = self.inner.open.upgrade() else {
+        if self.inner.notify_produced.is_closed() {
             return;
         };
 
@@ -602,10 +627,9 @@ impl Subscribe for OutputStream {
                 return;
             }
 
-            // FIXME: this is a bit hairy, we assume that eventually there will be a notification
-            // here. That works out, probably, but if the coroutine maintaining the ring is just
-            // dropped we may get stuck. We should use a kind of (send,recv) here instead.
-            notify.await;
+            if notify.await.is_err() {
+                return;
+            }
         }
     }
 }

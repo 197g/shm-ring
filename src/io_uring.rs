@@ -74,6 +74,21 @@ impl<T: 'static> SubmitAllocation for T {}
 
 type TimeoutDeque = VecDeque<Option<Rc<dyn SubmitAllocation>>>;
 
+/// How we block in `wait_for_message`.
+enum BlockStrategy {
+    /// We only take a futex on the remote liveness and the block flag.
+    None,
+    /// We set the block flag, then do `None`.
+    ///
+    /// This ensures that at most one thread is blocked.
+    Block,
+    /// We set our own indication bit, then do `None`.
+    ///
+    /// This is for asynchronous use where the other side can discover if a remote wakeup is
+    /// required even if it may be blocked itself.
+    Indicate,
+}
+
 /// Implements the client interfaces through queueing on the wrapped ring.
 impl ShmIoUring {
     pub fn new(shared_user_ring: &Shared) -> Result<Self, std::io::Error> {
@@ -306,11 +321,60 @@ impl ShmIoUring {
         })
     }
 
+    /// Wait until the other side wakes us.
+    ///
+    /// This asserts three futexes:
+    /// - the current remote's head with the value indicated
+    /// - that there is no block
+    /// - the remote's indicator being active
+    ///
+    /// If any of them fails a non-Ok `WaitResult` is returned. Returns an appropriate status code
+    /// depending on the futex being changed. If either the head or the blocked indicator is woken
+    /// then `Ok` is returned. If the remote indicator is changed then `RemoteInactive` is
+    /// presumed.
     pub async fn wait_for_message(
         &self,
         ring: &Ring,
         head: u32,
         timeout: time::Duration,
+    ) -> Result<WaitResult, std::io::Error> {
+        self.block_for_message_maybe_indicated(ring, head, timeout, BlockStrategy::None)
+            .await
+    }
+
+    /// Signal that we may be woken up to make more progress.
+    ///
+    /// Contrary to `block_for_message` this is not exclusive, we have another means of progress
+    /// and our side is still alive working on the ring (and in particular still capable of waking
+    /// the other side as soon as useful).
+    pub async fn indicate_for_message(
+        &self,
+        ring: &Ring,
+        head: u32,
+        timeout: time::Duration,
+    ) -> Result<WaitResult, std::io::Error> {
+        self.block_for_message_maybe_indicated(ring, head, timeout, BlockStrategy::Indicate)
+            .await
+    }
+
+    /// Wait until the other side wakes us, showing a status of doing so.
+    pub async fn block_for_message(
+        &self,
+        ring: &Ring,
+        head: u32,
+        timeout: time::Duration,
+    ) -> Result<WaitResult, std::io::Error> {
+        self.block_for_message_maybe_indicated(ring, head, timeout, BlockStrategy::Block)
+            .await
+    }
+
+    #[expect(unused_assignments)] // A guard value.
+    async fn block_for_message_maybe_indicated(
+        &self,
+        ring: &Ring,
+        head: u32,
+        timeout: time::Duration,
+        block: BlockStrategy,
     ) -> Result<WaitResult, std::io::Error> {
         assert!(self.shared_user_ring.same_ring(ring));
         let submit = self.non_empty_submission_and_then_sync(2).await?;
@@ -318,19 +382,70 @@ impl ShmIoUring {
         let rhead = ring.ring_head();
         let side = ring.side();
 
+        if rhead.select_producer(!side).load(atomic::Ordering::Relaxed) != head {
+            return Ok(WaitResult::Ok);
+        }
+
         if rhead.send_indicator(!side).load(atomic::Ordering::Relaxed) != 1 {
             return Ok(WaitResult::RemoteInactive);
         }
 
         if rhead.blocked.0.load(atomic::Ordering::Relaxed) != 0 {
-            return Ok(WaitResult::RemoteInactive);
+            return Ok(WaitResult::RemoteBlocked);
+        }
+
+        enum Unblock<'lt> {
+            None,
+            Block(&'lt crate::data::RingHead, crate::data::ClientSide),
+            Wait(&'lt crate::data::RingHead, crate::data::ClientSide),
+        }
+
+        impl Drop for Unblock<'_> {
+            fn drop(&mut self) {
+                match self {
+                    Unblock::None => {}
+                    Unblock::Block(head, side) => {
+                        // We do not care if we succeeded here or not, just if we were still blocked then
+                        // stop doing that.
+                        let _ = head.blocked.unblock(*side);
+                    }
+                    Unblock::Wait(head, side) => {
+                        head.wait_indicator(*side)
+                            .store(0, atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+
+        #[expect(unused_variables)]
+        let mut blocked = Unblock::None;
+        let mut blocked_expected = 0;
+
+        match block {
+            BlockStrategy::None => {}
+            BlockStrategy::Indicate => {
+                rhead
+                    .wait_indicator(side)
+                    .store(1, atomic::Ordering::Relaxed);
+
+                blocked = Unblock::Wait(rhead, side);
+            }
+            BlockStrategy::Block => {
+                if rhead.blocked.block(side).is_err() {
+                    return Ok(WaitResult::RemoteBlocked);
+                }
+
+                // Just for `Drop`.
+                blocked = Unblock::Block(rhead, side);
+                blocked_expected = side.as_block_slot();
+            }
         }
 
         let mut wakes = Rc::new([(); 3].map(|_| FutexWaitv::pending()));
         let [fblock, fsend, fhead] = Rc::get_mut(&mut wakes).unwrap();
 
         let blocking = &rhead.blocked.0;
-        *fblock = unsafe { FutexWaitv::from_u32_unchecked(blocking, 0) };
+        *fblock = unsafe { FutexWaitv::from_u32_unchecked(blocking, blocked_expected) };
 
         let indicator = rhead.send_indicator(!side);
         *fsend = unsafe { FutexWaitv::from_u32_unchecked(indicator, 1) };
@@ -356,7 +471,7 @@ impl ShmIoUring {
         unsafe { submit.redeem_push(&[entry, entry_to], [wakes, timespec]) };
 
         match key.wait().await {
-            Ok(0) => Ok(WaitResult::RemoteBlocked),
+            Ok(0) => Ok(WaitResult::Ok),
             Ok(1) => Ok(WaitResult::RemoteInactive),
             Ok(2) => Ok(WaitResult::Ok),
             Err(FutexWaitv::EAGAIN) => Ok(WaitResult::PreconditionFailed),
@@ -367,6 +482,39 @@ impl ShmIoUring {
         }
     }
 
+    /// Wake the other side, *if* it is blocked.
+    ///
+    /// Unblocks the other side before it is woken it. If the queue is not blocked on the other
+    /// side's actions, does nothing and returns `Ok(0)`. This is quite a cheap action.
+    pub async fn wake_block(&self, ring: &Ring) -> Result<u32, std::io::Error> {
+        let rhead = ring.ring_head();
+        let side = ring.side();
+
+        if rhead.blocked.unblock(!side).is_ok() {
+            self.wake(ring).await
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Wake the other side, *if* it indicates.
+    ///
+    /// If the other side does not indicate, does nothing and returns `Ok(0)`. This is quite a
+    /// cheap action but note that it does not introduce any happens-before order. If the other
+    /// side starts waiting after we checked its flag, we may miss it. You will need to check again
+    /// regularly, i.e. still be live, to continue communication.
+    pub async fn wake_indicated(&self, ring: &Ring) -> Result<u32, std::io::Error> {
+        let rhead = ring.ring_head();
+        let side = ring.side();
+
+        if rhead.wait_indicator(!side).load(atomic::Ordering::Relaxed) != 0 {
+            self.wake(ring).await
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Wait the block futex and the other side's producer futex.
     pub async fn wake(&self, ring: &Ring) -> Result<u32, std::io::Error> {
         assert!(self.shared_user_ring.same_ring(ring));
         let submit = self.non_empty_submission_and_then_sync(2).await?;
