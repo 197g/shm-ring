@@ -13,10 +13,15 @@ extern crate alloc;
 pub mod client;
 pub mod data;
 pub mod frame;
+mod mmap;
 pub mod ring;
+pub mod secret;
 pub mod server;
 /// Contains all code to interacts with the OS directly.
 mod uapi;
+
+/// An implementation of `RetainedMemory`.
+pub use mmap::MmapRaw;
 
 #[cfg(feature = "io-uring")]
 pub mod io_uring;

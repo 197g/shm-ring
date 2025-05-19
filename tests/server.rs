@@ -3,7 +3,7 @@ use shm_pbx::data::{ClientIdentifier, ClientSide, RingIndex};
 use shm_pbx::frame::Shared;
 use shm_pbx::server::{RingConfig, RingVersion, ServerConfig};
 
-use memmap2::MmapRaw;
+use shm_pbx::MmapRaw;
 use tempfile::NamedTempFile;
 
 #[test]
@@ -14,7 +14,7 @@ fn create_server() {
     let file = NamedTempFile::new().unwrap();
     file.as_file().set_len(0x1_000_000).unwrap();
 
-    let map = MmapRaw::map_raw(&file).unwrap();
+    let map = MmapRaw::from_fd(&file).unwrap();
     // Fulfills all the pre-conditions of alignment to map.
     let shared = Shared::new(map).unwrap();
 
