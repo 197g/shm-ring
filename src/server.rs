@@ -194,16 +194,26 @@ impl Server {
 
         for (slot, ids) in self.server.info.into_iter().zip(ids) {
             let Some(rhs) = data::RingIdentifier::new(ids.rhs) else {
+                // eprintln!("Skipping, rhs initialized");
                 continue;
             };
 
             let Some(lhs) = data::RingIdentifier::new(ids.lhs) else {
+                // eprintln!("Skipping, lhs initialized");
                 continue;
             };
 
             if !slot.lhs.is_owned_by_server_as_checked_by_server()
                 || !slot.rhs.is_owned_by_server_as_checked_by_server()
             {
+                /*
+                eprintln!(
+                    "Skipping, {}/{} not owned by server",
+                    slot.lhs.is_owned_by_server_as_checked_by_server(),
+                    slot.rhs.is_owned_by_server_as_checked_by_server(),
+                );
+                */
+
                 continue;
             }
 

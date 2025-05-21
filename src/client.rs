@@ -391,14 +391,18 @@ impl Ring {
 
         let blocking = &self.map.ring_slot.head.blocked.0;
         let loaded = blocking.load(atomic::Ordering::Relaxed);
-        *fblock = uapi::FutexWaitv::from_u32(blocking, loaded);
+        let indicator = self.map.remote_indicator();
 
         // Line is going down.
         if (loaded as i32) < 0 {
             return WaitResult::RemoteBlocked;
         }
 
-        let indicator = self.map.remote_indicator();
+        if indicator.load(atomic::Ordering::Relaxed) != 0 {
+            return WaitResult::Ok;
+        }
+
+        *fblock = uapi::FutexWaitv::from_u32(blocking, loaded);
         *fsend = uapi::FutexWaitv::from_u32(indicator, 0);
 
         match uapi::futex_waitv(&mut wakes, timeout) {

@@ -54,12 +54,24 @@ fn create_server() {
 
     let handle = std::thread::spawn(|| {
         let rhs = join_rhs.unwrap();
-        let guard = rhs.lock_for_message().expect("Not guarded by rhs");
 
+        // sequences with (seq-1) from the lhs.
+        let guard = rhs.lock_for_message().expect("Not guarded by rhs");
         // This unlock spuriously whenever the other side notifies us to check for new messages via
         // `wake`. While locked, they can check via a relaxed load whether the lock is taken.
         assert_eq!(guard.wake(Duration::from_millis(1_000)), WaitResult::Ok);
-        assert_eq!(rhs.activate(), 1);
+
+        // Depending on the race of activation, we may awake the other's wait or we activate before
+        // they even check in which case they will get signalled readiness through an atomic read
+        // without having to go through a futex.
+        assert!(rhs.activate() <= 1);
+
+        // Sequences with (seq-2) from the lhs.
+        let guard = rhs.lock_for_message().expect("Not guarded by rhs");
+        assert_eq!(guard.wake(Duration::from_millis(1_000)), WaitResult::Ok);
+
+        // Ensure we do not deactivate.
+        core::mem::forget(rhs);
     });
 
     let lhs = join_lhs.unwrap();
@@ -67,9 +79,10 @@ fn create_server() {
     // Does not correspond to our initial assumptions (still inactive), so this must fail.
     assert_eq!(
         lhs.wait_for_message(0, Duration::from_millis(0)),
-        WaitResult::PreconditionFailed
+        WaitResult::RemoteInactive
     );
 
+    // This is (seq-1)
     // yes we spin-loop to unlock here, as we don't really expect to produce messages.
     while lhs.wake() == 0 {}
 
@@ -90,7 +103,10 @@ fn create_server() {
         !lhs.is_active_remote()
     } {}
 
-    handle.join().expect("Successfully waited");
+    // This is (seq-2)
+    while lhs.wake() == 0 {}
 
+    // Tear down, both threads of execution should get done by our sequencing.
+    handle.join().expect("Successfully waited");
     let _ = { server };
 }

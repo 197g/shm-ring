@@ -77,6 +77,7 @@ fn create_server() {
 
     assert!(join_rhs.is_ok());
     drop(join_rhs);
+    drop(join_lhs);
 
     // We can not immediately join it again, we've given the slot up to the server.
     let tid = ClientIdentifier::new();
@@ -95,6 +96,10 @@ fn create_server() {
         tid,
     });
 
-    assert!(join_rhs.is_ok());
+    assert!(join_rhs.is_ok(), "{:?}", match join_rhs {
+        Ok(_) => unreachable!("we checked okay"),
+        Err(e) => e,
+    });
+
     let _ = (server, client);
 }
