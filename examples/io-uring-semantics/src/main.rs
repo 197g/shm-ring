@@ -122,8 +122,9 @@ async fn main_coordinator() -> Result<(), std::io::Error> {
 
         const CANCELLABLE: u64 = 0;
 
-        let wake =
-            opcode::FutexWait::new(map.as_ptr() as *const u32, 0, u32::MAX.into(), 0x02).build().user_data(CANCELLABLE);
+        let wake = opcode::FutexWait::new(map.as_ptr() as *const u32, 0, u32::MAX.into(), 0x02)
+            .build()
+            .user_data(CANCELLABLE);
 
         unsafe { submit.redeem_push(&[wake], []) };
 

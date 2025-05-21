@@ -96,10 +96,14 @@ fn create_server() {
         tid,
     });
 
-    assert!(join_rhs.is_ok(), "{:?}", match join_rhs {
-        Ok(_) => unreachable!("we checked okay"),
-        Err(e) => e,
-    });
+    assert!(
+        join_rhs.is_ok(),
+        "{:?}",
+        match join_rhs {
+            Ok(_) => unreachable!("we checked okay"),
+            Err(e) => e,
+        }
+    );
 
     let _ = (server, client);
 }

@@ -239,7 +239,8 @@ const _: () = {
     const ASSERT: [(); 1] = [(); 1];
     ASSERT[(core::mem::offset_of!(RingHeadHalf, producer) % ANTI_INTERFERENCE_ALIGN_AND_SIZE)];
     ASSERT[(core::mem::offset_of!(RingHeadHalf, consumer) % ANTI_INTERFERENCE_ALIGN_AND_SIZE)];
-    ASSERT[(core::mem::offset_of!(RingHeadHalf, send_indicator) % ANTI_INTERFERENCE_ALIGN_AND_SIZE)];
+    ASSERT
+        [(core::mem::offset_of!(RingHeadHalf, send_indicator) % ANTI_INTERFERENCE_ALIGN_AND_SIZE)];
     ASSERT[(core::mem::offset_of!(RingHeadHalf, _eos) % ANTI_INTERFERENCE_ALIGN_AND_SIZE)];
 };
 

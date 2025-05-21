@@ -1,8 +1,8 @@
 use std::{
     collections::VecDeque,
     ops::Range,
-    sync::{atomic, Arc, Mutex},
     rc::Rc,
+    sync::{atomic, Arc, Mutex},
 };
 
 use crate::notify::{CloseableNotifyReader, CloseableNotifyWriter};
@@ -352,7 +352,7 @@ impl OutputRing {
                     _ = recheck.tick() => {},
                     _ = more_data, if no_more_messages => {},
                     _ = ready, if immediate || likely_get_more_data || !no_more_messages => {}
-                    wait = io.indicate_for_message(&ring, head_receive, 5 * recheck_time), if !likely_get_more_data => { 
+                    wait = io.indicate_for_message(&ring, head_receive, 5 * recheck_time), if !likely_get_more_data => {
                         // FIXME: handle wait, particular exit.
                     }
                 };

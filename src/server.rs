@@ -105,7 +105,10 @@ impl Server {
             "Being lied to about the client"
         );
 
-        eprintln!("Removing a client with {} ring entries", client_data.rings.len());
+        eprintln!(
+            "Removing a client with {} ring entries",
+            client_data.rings.len()
+        );
 
         for (idx, side) in client_data.rings {
             let Some(ring) = self.server.info.get(data::RingIndex(idx)) else {
