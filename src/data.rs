@@ -162,6 +162,40 @@ const _: () = {
 #[repr(transparent)]
 pub struct RingBlockedSlot(pub(crate) AtomicU32);
 
+impl RingBlockedSlot {
+    pub fn block(&self, side: ClientSide) -> Result<(), i32> {
+        let block_val = side.as_block_slot();
+
+        match self.0
+            .compare_exchange_weak(
+                0,
+                block_val,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+        {
+            Ok(_) => Ok(()),
+            Err(n) if n == block_val => Ok(()),
+            Err(u) => Err(u as i32),
+        }
+    }
+
+    pub fn unblock(&self, side: ClientSide) -> Result<(), i32> {
+        match self.0
+            .compare_exchange_weak(
+                side.as_block_slot(),
+                0,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+        {
+            Ok(_) => Ok(()),
+            Err(n) if n == 0 => Ok(()),
+            Err(u) => Err(u as i32),
+        }
+    }
+}
+
 #[repr(C)]
 pub struct RingHeadHalf {
     pub producer: AtomicU32,
@@ -181,7 +215,17 @@ pub struct RingHeadHalf {
     /// is deactivate momentarily. (Note this is separate from `RingHead::blocked`'s attribute).
     /// Each transition should wake any futex blocked on the value.
     pub send_indicator: AtomicU32,
-    pub _padding2: NoAccess<UnsafeCell<[u32; 63]>>,
+    /// A flag signalling whether the producer is asynchronously waiting for more messages.
+    ///
+    /// Do *not* futex-wait on this. This signal is under full control of the side that sets it.
+    /// However do note that suspending while this flag is set may not have semantics you intend.
+    /// It can *not* be used for a mechanism that excludes both sides being suspended. Instead, you
+    /// can use this if you are also resumed by a signal that causes you to produce new data.
+    ///
+    /// You may note this is in the same cache line as `send_indicator` as both are controlled by
+    /// the same side and the indicator is only rarely toggled.
+    pub wait_indicator: AtomicU32,
+    pub _padding2: NoAccess<UnsafeCell<[u32; 62]>>,
     pub _eos: [u8; 0],
 }
 
@@ -322,33 +366,16 @@ impl ClientSlot {
         }
     }
 
-    pub(crate) fn is_open_heuristically(&self) -> Result<bool, ClientIdentifier> {
-        match self.owner.load(Ordering::Relaxed) as i32 {
-            n @ 1.. => Err(ClientIdentifier(n as u64)),
-            0 => Ok(false),
-            _ => Ok(true),
-        }
-    }
-
     /// Check if the server is the authority to write to this slot, i.e. if it is `0`.
     ///
     /// On `true`, the server is the only one allowed to turn it false thus this is also a
     /// non-ephemeral answer. After `true` the server can rely on all effects having been seen.
-    pub(crate) fn take_for_server(&self) -> Result<Option<RingIdentifier>, ClientIdentifier> {
-        // Acquire the ring's head as 0, if it is currently shared.
-        let acquisition =
-            self.owner
-                .fetch_update(Ordering::Acquire, Ordering::Relaxed, |n: u32| {
-                    Some(0).filter(|_| (n as i32) < 0)
-                });
-
-        match acquisition {
-            Ok(id) => Ok(Some(RingIdentifier(id as i32))),
-            Err(0) => Ok(None),
-            Err(id) => {
-                debug_assert!(id > 0);
-                Err(ClientIdentifier(id as u64))
-            }
+    pub(crate) fn is_owned_by_server_as_checked_by_server(&self) -> bool {
+        if self.owner.load(Ordering::Relaxed) == 0 {
+            core::sync::atomic::fence(Ordering::Acquire);
+            true
+        } else {
+            false
         }
     }
 
@@ -458,6 +485,13 @@ impl RingHead {
         match side {
             ClientSide::Left => &self.lhs.send_indicator,
             ClientSide::Right => &self.rhs.send_indicator,
+        }
+    }
+
+    pub fn wait_indicator(&self, side: ClientSide) -> &AtomicU32 {
+        match side {
+            ClientSide::Left => &self.lhs.wait_indicator,
+            ClientSide::Right => &self.rhs.wait_indicator,
         }
     }
 

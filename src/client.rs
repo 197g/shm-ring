@@ -391,14 +391,18 @@ impl Ring {
 
         let blocking = &self.map.ring_slot.head.blocked.0;
         let loaded = blocking.load(atomic::Ordering::Relaxed);
-        *fblock = uapi::FutexWaitv::from_u32(blocking, loaded);
+        let indicator = self.map.remote_indicator();
 
         // Line is going down.
         if (loaded as i32) < 0 {
             return WaitResult::RemoteBlocked;
         }
 
-        let indicator = self.map.remote_indicator();
+        if indicator.load(atomic::Ordering::Relaxed) != 0 {
+            return WaitResult::Ok;
+        }
+
+        *fblock = uapi::FutexWaitv::from_u32(blocking, loaded);
         *fsend = uapi::FutexWaitv::from_u32(indicator, 0);
 
         match uapi::futex_waitv(&mut wakes, timeout) {
@@ -424,6 +428,15 @@ impl Ring {
     /// - The head of the list is changed, with the other side waking waiters.
     /// - The timeout is reached.
     pub fn wait_for_message(&self, head: u32, timeout: time::Duration) -> WaitResult {
+        if self.map.remote_indicator().load(atomic::Ordering::Relaxed) != 1 {
+            return WaitResult::RemoteInactive;
+        }
+
+        let blocking = &self.map.ring_slot.head.blocked.0;
+        if blocking.load(atomic::Ordering::Relaxed) != 0 {
+            return WaitResult::RemoteInactive;
+        }
+
         let mut wakes = [(); 3].map(|_| uapi::FutexWaitv::pending());
         let [fblock, fsend, fhead] = &mut wakes;
 
@@ -458,6 +471,12 @@ impl Ring {
 
     pub(crate) fn side(&self) -> data::ClientSide {
         self.map.ring_slot.side
+    }
+}
+
+impl Drop for Ring {
+    fn drop(&mut self) {
+        self.deactivate();
     }
 }
 
@@ -524,10 +543,10 @@ impl OwnedRingSlot {
         // one side must take at a time and which can be stolen when the whole ring is going to be
         // shut down).
         let owner = (!self.side).as_block_slot();
-        let Ok(_n_waiters_moved) = slot.cmp_requeue(owner, 0, producer, i32::MAX) else {
+
+        if let Err(_) = slot.cmp_requeue(owner, 0, producer, i32::MAX) {
             // Oh, the lock wasn't actually taken. Obviously if we'd have taken the lock then we
             // wouldn't be running in this. Right?
-            return 0;
         };
 
         producer.wake(i32::MAX) as u32

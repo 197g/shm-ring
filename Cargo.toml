@@ -7,13 +7,15 @@ rust-version = "1.70"
 [dependencies]
 io-uring = { version = "0.6", optional = true }
 hashbrown = "0.14.3"
+libc = { version = "0.2" }
 # Synchronous waiting with a futex interface
 linux-futex = "0.2"
-memmap2 = "0.9"
 # Using the high-level crate instead of `libc` as an abstraction of safe
 # patterns. Also I'm hoping to encourage (myself, other authors) to contribute
 # towards such stable, idiomatic bindings as its official support list is
 # woeful.
+# FIXME: no_std support; there are no good safe libc wrappers that are strictly
+# `no_std`.
 uapi = { version = "0.2.13", optional = true }
 slotmap = { version = "1", optional = true, default-features = false }
 tokio = { version = "1", optional = true, features = ["macros", "net", "sync", "rt"] }

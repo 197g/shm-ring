@@ -4,9 +4,12 @@ use core::{alloc, cell::UnsafeCell, mem, ptr};
 
 use crate::{client, data, server};
 
-use memmap2::MmapRaw;
+use crate::mmap::MmapRaw;
 
+/// A container owning some shared mapped memory.
 pub unsafe trait RetainedMemory: Send + Sync {
+    /// Return a pointer to memory. This must have provenance to access the memory atomically.
+    /// Calling this method twice must *not* invalidate any other previously returned pointer.
     fn data_from_head(&self) -> *mut [u8];
 }
 
@@ -173,14 +176,6 @@ impl Shared {
     /// Is the ring operating on the same underlying file?
     pub fn same_ring(&self, client: &client::Ring) -> bool {
         Arc::ptr_eq(&self._retain, &client.shared_ring()._retain)
-    }
-}
-
-unsafe impl RetainedMemory for MmapRaw {
-    fn data_from_head(&self) -> *mut [u8] {
-        let ptr = self.as_mut_ptr();
-        let len = self.len();
-        ptr::slice_from_raw_parts_mut(ptr, len)
     }
 }
 

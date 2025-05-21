@@ -1,3 +1,4 @@
+mod notify;
 mod stream;
 
 use shm_pbx::client::{Client, Ring, RingJoinError, RingRequest};
@@ -8,10 +9,10 @@ use shm_pbx::io_uring::ShmIoUring;
 use memmap2::MmapRaw;
 use quick_error::quick_error;
 use serde::Deserialize;
-use wasmtime::{Module, Store};
+use wasmtime::{Instance, Module, Store};
 use wasmtime_wasi::{preview1, WasiCtxBuilder};
 
-use std::{fs, path::PathBuf, sync};
+use std::{fs, path::PathBuf, rc, sync};
 
 #[derive(Deserialize)]
 struct Options {
@@ -121,22 +122,14 @@ fn main() -> Result<(), Error> {
         panic!("Parser validation failed");
     };
 
-    let file = fs::File::open(config).map_err(|err| {
-        eprintln!("Failed to read configuration file {err:?}");
-        err
-    })?;
-
+    let file = fs::File::open(config)?;
     let options: Options = serde_json::de::from_reader(file)?;
     let opt_path = config.parent().unwrap();
 
     let server = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(server)
-        .map_err(|err| {
-            eprintln!("Failed to open ring file {err:?}");
-            err
-        })?;
+        .open(server)?;
 
     let map = MmapRaw::map_raw(&server).unwrap();
     // Fulfills all the pre-conditions of alignment to map.
@@ -144,14 +137,17 @@ fn main() -> Result<(), Error> {
     let client = shared.into_client().expect("Have initialized client");
 
     let tid = ClientIdentifier::new();
-    let mod_options = &options.modules[0];
 
     let mut config = wasmtime::Config::new();
     config.async_support(true);
     config.consume_fuel(true);
     let engine = wasmtime::Engine::new(&config)?;
 
-    let program = new_program(&engine, &mod_options, &client, tid, opt_path.to_path_buf())?;
+    let programs = options
+        .modules
+        .iter()
+        .map(|mod_options| new_program(&engine, &mod_options, &client, tid, opt_path.to_path_buf()))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let host = host(&options, &client, tid)?;
 
@@ -160,21 +156,41 @@ fn main() -> Result<(), Error> {
         .enable_time()
         .build()?;
 
+    let mut now = std::time::Instant::now();
     rt.block_on(async {
         let local = tokio::task::LocalSet::new();
 
-        let uring = ShmIoUring::new(&shared).map_err(ClientIoUring)?;
-        let uring = sync::Arc::new(uring);
+        for program in programs {
+            let shared = shared.clone();
 
-        let host = communicate_host(uring.clone(), host, &local);
-        let client = communicate(uring.clone(), program, &local);
+            // If we could we might run this transparently on another thread. But this can not move
+            // after its creation. It is not `Send` due to the uring and localset being alive
+            // across await points. Therefore to realize such a system we need to spawn a dedicated
+            // thread and send the task description to it.
+            let run_module = async move {
+                let shared = shared;
+                let local = tokio::task::LocalSet::new();
+                let uring = rc::Rc::new(ShmIoUring::new(&shared).map_err(ClientIoUring)?);
 
-        local
-            .run_until(async move { tokio::try_join!(host, client,) })
-            .await?;
+                let (store, instance) = instantiate(uring.clone(), program, &local).await?;
+                local.run_until(communicate(store, instance)).await?;
+
+                Ok::<_, ClientRunError>(())
+            };
+
+            local.spawn_local(run_module);
+        }
+
+        let uring = rc::Rc::new(ShmIoUring::new(&shared).map_err(ClientIoUring)?);
+        let host = communicate_host(uring, host, &local);
+
+        now = std::time::Instant::now();
+        local.run_until(host).await?;
 
         Ok::<_, ClientRunError>(())
     })?;
+
+    eprintln!("Time elapsed: {}ms", now.elapsed().as_millis());
 
     Ok(())
 }
@@ -193,19 +209,15 @@ fn new_program(
         stderr,
     } = &options;
 
-    let module = opt_path.join(module);
-    let module = module.canonicalize()?;
-
-    let module = std::fs::read(module).map_err(|err| {
-        eprintln!("Failed to read WASM module {err:?}");
-        err
-    })?;
-
-    let module = Module::new(&engine, module)?;
-
     let stdin = join_ring(stdin.as_ref(), client, tid)?;
     let stdout = join_ring(stdout.as_ref(), client, tid)?;
     let stderr = join_ring(stderr.as_ref(), client, tid)?;
+
+    let module = opt_path.join(module);
+    let module = module.canonicalize()?;
+
+    let module = std::fs::read(module)?;
+    let module = Module::new(&engine, module)?;
 
     Ok(Program {
         module,
@@ -235,11 +247,17 @@ fn join_ring(
 ) -> Result<Option<Ring>, RingJoinError> {
     options
         .map(|opt| {
-            client.join(&RingRequest {
+            let mut ring = client.join(&RingRequest {
                 index: RingIndex(opt.index),
                 side: opt.side,
                 tid,
-            })
+            });
+
+            if let Ok(ring) = &mut ring {
+                ring.activate();
+            }
+
+            ring
         })
         .transpose()
 }
@@ -250,12 +268,6 @@ struct Stdin {
 
 struct Stdout {
     inner: stream::OutputRing,
-}
-
-impl Drop for Stdout {
-    fn drop(&mut self) {
-        self.inner.close();
-    }
 }
 
 impl wasmtime_wasi::StdinStream for Stdin {
@@ -270,7 +282,7 @@ impl wasmtime_wasi::StdinStream for Stdin {
 
 impl wasmtime_wasi::StdoutStream for Stdout {
     fn stream(&self) -> Box<dyn wasmtime_wasi::HostOutputStream> {
-        Box::new(self.inner.clone())
+        Box::new(self.inner.stream())
     }
 
     fn isatty(&self) -> bool {
@@ -278,11 +290,11 @@ impl wasmtime_wasi::StdoutStream for Stdout {
     }
 }
 
-async fn communicate(
-    uring: sync::Arc<ShmIoUring>,
+async fn instantiate(
+    uring: rc::Rc<ShmIoUring>,
     program: Program,
     local: &tokio::task::LocalSet,
-) -> Result<(), ClientRunError> {
+) -> Result<(Store<ModuleP1Data>, Instance), ClientRunError> {
     let main = ModuleP1Data {
         ctx: {
             let mut ctx = WasiCtxBuilder::new();
@@ -330,9 +342,16 @@ async fn communicate(
         .instantiate_async(&mut store, &program.module)
         .await?;
 
+    Ok((store, instance))
+}
+
+async fn communicate(
+    mut store: Store<ModuleP1Data>,
+    instance: Instance,
+) -> Result<(), ClientRunError> {
     let main = instance.get_typed_func::<(), ()>(&mut store, "_start")?;
 
-    const FUEL: u64 = 1 << 12;
+    const FUEL: u64 = 1 << 18;
     store.fuel_async_yield_interval(Some(FUEL))?;
     store.set_fuel(u64::MAX)?;
 
@@ -342,7 +361,7 @@ async fn communicate(
 }
 
 async fn communicate_host(
-    uring: sync::Arc<ShmIoUring>,
+    uring: rc::Rc<ShmIoUring>,
     host: Host,
     local: &tokio::task::LocalSet,
 ) -> Result<(), ClientRunError> {
@@ -367,14 +386,16 @@ async fn communicate_host(
 }
 
 async fn move_stdin(
-    uring: sync::Arc<ShmIoUring>,
+    uring: rc::Rc<ShmIoUring>,
     ring: Ring,
     local: &tokio::task::LocalSet,
 ) -> Result<(), ClientRunError> {
     use tokio::io::AsyncBufReadExt as _;
     use wasmtime_wasi::HostOutputStream as _;
 
-    let mut proxy = stream::OutputRing::new(ring, uring.clone(), &local);
+    let proxy = stream::OutputRing::new(ring, uring.clone(), &local);
+    let mut proxy = proxy.stream();
+
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
 
     const SIZE: usize = 1 << 12;
@@ -413,12 +434,11 @@ async fn move_stdin(
         tokio::task::yield_now().await;
     }
 
-    proxy.close();
     Ok(())
 }
 
 async fn move_stdout(
-    uring: sync::Arc<ShmIoUring>,
+    uring: rc::Rc<ShmIoUring>,
     ring: Ring,
     local: &tokio::task::LocalSet,
 ) -> Result<(), ClientRunError> {
@@ -426,7 +446,8 @@ async fn move_stdout(
     use wasmtime_wasi::{HostInputStream as _, Subscribe};
 
     let mut proxy = stream::InputRing::new(ring, uring.clone(), &local);
-    let mut stdout = tokio::io::stdout();
+    let mut stdout = tokio::io::BufWriter::new(tokio::io::stdout());
+
     const SIZE: usize = 1 << 12;
 
     loop {
@@ -437,11 +458,16 @@ async fn move_stdout(
                 continue;
             }
             Err(wasmtime_wasi::StreamError::Closed) => break,
-            Err(_err) => panic!(),
+            Err(err) => {
+                eprintln!("{err:?}");
+                panic!()
+            }
         };
 
         stdout.write_all(&bytes).await.map_err(ClientIoUring)?;
     }
+
+    stdout.flush().await.map_err(ClientIoUring)?;
 
     Ok(())
 }

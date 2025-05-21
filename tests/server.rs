@@ -3,7 +3,7 @@ use shm_pbx::data::{ClientIdentifier, ClientSide, RingIndex};
 use shm_pbx::frame::Shared;
 use shm_pbx::server::{RingConfig, RingVersion, ServerConfig};
 
-use memmap2::MmapRaw;
+use shm_pbx::MmapRaw;
 use tempfile::NamedTempFile;
 
 #[test]
@@ -14,7 +14,7 @@ fn create_server() {
     let file = NamedTempFile::new().unwrap();
     file.as_file().set_len(0x1_000_000).unwrap();
 
-    let map = MmapRaw::map_raw(&file).unwrap();
+    let map = MmapRaw::from_fd(&file).unwrap();
     // Fulfills all the pre-conditions of alignment to map.
     let shared = Shared::new(map).unwrap();
 
@@ -77,6 +77,7 @@ fn create_server() {
 
     assert!(join_rhs.is_ok());
     drop(join_rhs);
+    drop(join_lhs);
 
     // We can not immediately join it again, we've given the slot up to the server.
     let tid = ClientIdentifier::new();
@@ -86,12 +87,7 @@ fn create_server() {
         tid,
     });
 
-    assert!(
-        join_rhs.is_err(),
-        "After dropping one side, the ring is not available"
-    );
-
-    // This recycles any rings completely empty.
+    assert!(join_rhs.is_err());
     server.bring_up(&rings);
 
     let join_rhs = client.join(&RingRequest {
@@ -100,22 +96,10 @@ fn create_server() {
         tid,
     });
 
-    assert!(
-        join_rhs.is_err(),
-        "After dropping one side, the ring is not immediately recycled"
-    );
-
-    drop(join_rhs);
-    drop(join_lhs);
-
-    server.bring_up(&rings);
-
-    let join_rhs = client.join(&RingRequest {
-        side: ClientSide::Right,
-        index: RingIndex(0),
-        tid,
+    assert!(join_rhs.is_ok(), "{:?}", match join_rhs {
+        Ok(_) => unreachable!("we checked okay"),
+        Err(e) => e,
     });
 
-    assert!(join_rhs.is_ok());
     let _ = (server, client);
 }

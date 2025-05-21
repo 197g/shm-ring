@@ -105,10 +105,7 @@ impl Server {
             "Being lied to about the client"
         );
 
-        eprintln!(
-            "Removing a client with {} ring entries",
-            client_data.rings.len()
-        );
+        eprintln!("Removing a client with {} ring entries", client_data.rings.len());
 
         for (idx, side) in client_data.rings {
             let Some(ring) = self.server.info.get(data::RingIndex(idx)) else {
@@ -197,40 +194,28 @@ impl Server {
 
         for (slot, ids) in self.server.info.into_iter().zip(ids) {
             let Some(rhs) = data::RingIdentifier::new(ids.rhs) else {
+                // eprintln!("Skipping, rhs initialized");
                 continue;
             };
 
             let Some(lhs) = data::RingIdentifier::new(ids.lhs) else {
+                // eprintln!("Skipping, lhs initialized");
                 continue;
             };
 
-            // Ensure that we don't churn the below writes too much.
-            //
-            // Firstly there must not be a client.
-            let Ok(open_lhs) = slot.lhs.is_open_heuristically() else {
-                continue;
-            };
+            if !slot.lhs.is_owned_by_server_as_checked_by_server()
+                || !slot.rhs.is_owned_by_server_as_checked_by_server()
+            {
+                /*
+                eprintln!(
+                    "Skipping, {}/{} not owned by server",
+                    slot.lhs.is_owned_by_server_as_checked_by_server(),
+                    slot.rhs.is_owned_by_server_as_checked_by_server(),
+                );
+                */
 
-            let Ok(open_rhs) = slot.rhs.is_open_heuristically() else {
-                continue;
-            };
-
-            // Secondly at least one must truly require re-initialization.
-            if open_lhs && open_rhs {
                 continue;
             }
-
-            // FIXME we should decide on the policy here. We might have reset the owner of this
-            // ring from a shared state. Should we then change the new ID to the one which it was
-            // currently shared with, or the one in the configuration? We assume these to be the
-            // same here but that may change in another code path.
-            let Ok(_lhs_update) = slot.lhs.take_for_server() else {
-                continue;
-            };
-
-            let Ok(_rhs_update) = slot.rhs.take_for_server() else {
-                continue;
-            };
 
             let ring_head = self.borrow_ring_head(slot);
             ring_head.reinit_holding_as_server();

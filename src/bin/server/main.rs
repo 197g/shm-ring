@@ -7,8 +7,8 @@ use shm_pbx::io_uring::ShmIoUring;
 use shm_pbx::server::{
     RingConfig, RingVersion, ServerConfig, ServerError, ServerTask, TrackedClient,
 };
+use shm_pbx::MmapRaw;
 
-use memmap2::MmapRaw;
 use quick_error::quick_error;
 use serde::Deserialize;
 use tempfile::NamedTempFile;
@@ -127,7 +127,7 @@ fn main() -> Result<(), Error> {
 
     let file = NamedTempFile::new()?;
     file.as_file().set_len(options.size)?;
-    let map = MmapRaw::map_raw(&file)?;
+    let map = MmapRaw::from_fd(&file).map_err(std::io::Error::from)?;
 
     if options.version != 1 {
         return Err(OptionsError::UnsupportedVersion)?;
