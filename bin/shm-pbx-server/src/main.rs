@@ -70,6 +70,7 @@ quick_error! {
             from()
         }
         IoUring (err: std::io::Error) {
+            from()
             from(err: ServeIoUring) -> (err.0)
         }
         UnsupportedOs {}
@@ -220,7 +221,7 @@ async fn serve_map_in(shared: Shared, options: Options) -> Result<(), ServerServ
             }
         }
 
-        if let Some(next_server_state) = next_server_state {
+        if let Some((_, next_server_state)) = next_server_state {
             uring.ack_server(&server, next_server_state).await?;
         } else {
             std::hint::spin_loop();

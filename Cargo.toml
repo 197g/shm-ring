@@ -1,75 +1,13 @@
-[package]
-name = "shm-pbx"
-version = "0.0.0"
-edition = "2021"
-rust-version = "1.70"
-
-[dependencies]
-io-uring = { version = "0.7", optional = true }
-hashbrown = "0.15"
-libc = { version = "0.2" }
-# Synchronous waiting with a futex interface
-linux-futex = "1"
-# Using the high-level crate instead of `libc` as an abstraction of safe
-# patterns. Also I'm hoping to encourage (myself, other authors) to contribute
-# towards such stable, idiomatic bindings as its official support list is
-# woeful.
-# FIXME: no_std support; there are no good safe libc wrappers that are strictly
-# `no_std`.
-uapi = { version = "0.2.13", optional = true }
-slotmap = { version = "1", optional = true, default-features = false }
-tokio = { version = "1", optional = true, features = ["macros", "net", "sync", "rt"] }
-
-# Just binaries, this is our interface.
-clap = { version = "4", optional = true }
-quick-error = { version = "1", optional = true }
-serde = { version = "1", optional = true }
-serde_json = { version = "1", optional = true }
-tempfile = { version = "3.10", optional = true }
-
-[features]
-# We should call these required features, but the goal is to allow pivot to
-# some other OS-level integration if we need it. In particular, interacting
-# with the file paths and getting a pid might not even need the overheads of a
-# (synchronous) syscall if there are other strategies. We might have cached the
-# PID, want to do file traversal async, etc.
-#
-# FIXME: disable these defaults? We want to have a true choice.
-default = ["uapi", "io-uring"]
-# The IO-uring state tracking needs slotmap. We're using tokio for eventing a
-# file descriptor, spawning a background task to maintain it, and
-# Notify/Semaphore asynchronous coordination.
-io-uring = ["dep:io-uring", "dep:slotmap", "tokio"]
-
-bin = [
-  "clap/cargo",
-  "io-uring",
-  "uapi",
-  "quick-error",
-  "dep:clap",
-  "dep:serde",
-  "dep:serde_json",
-  "serde/derive",
-  "dep:tempfile",
-]
-
-[lib]
-crate-type = ["cdylib", "lib"]
-
-[[bin]]
-name = "shm-pbx-server"
-path = "src/bin/server/main.rs"
-required-features = ["bin"]
-
-[dev-dependencies]
-tempfile = "3.10"
-tokio = { version = "1", features = ["fs", "macros", "io-util", "rt-multi-thread"] }
-
 [workspace]
 members = [
-  ".",
+  "bin/shm-pbx-server",
+  "lib/shm-pbx",
   "examples/client-wasi",
   "examples/fizz-buzz",
   "examples/io-uring-semantics",
   "xtask/cbindgen",
 ]
+resolver = "2"
+
+[workspace.dependencies]
+shm-pbx = { path = "lib/shm-pbx", version = "0.0.0" }

@@ -1493,15 +1493,25 @@ dependencies = [
 name = "shm-pbx"
 version = "0.0.0"
 dependencies = [
- "clap 4.5.4",
  "hashbrown 0.15.3",
  "io-uring",
  "libc",
  "linux-futex",
+ "slotmap",
+ "tempfile",
+ "tokio",
+ "uapi",
+]
+
+[[package]]
+name = "shm-pbx-server"
+version = "0.0.0"
+dependencies = [
+ "clap 4.5.4",
  "quick-error",
  "serde",
  "serde_json",
- "slotmap",
+ "shm-pbx",
  "tempfile",
  "tokio",
  "uapi",
