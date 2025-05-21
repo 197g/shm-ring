@@ -83,6 +83,10 @@ async fn sync_rings() {
 
     let hdl = tokio::task::spawn_blocking(move || {
         rhs.activate();
+        // Avoid that side deactivating again! This leaks the ownership of the ring but that is
+        // fine as far as the data model is concerned. You just can not join that ring queue
+        // specifically again, but still drain the queue and demap the memory.
+        core::mem::forget(rhs);
     });
 
     eprintln!("Activating");

@@ -9,7 +9,7 @@ pub struct MemfdSecret {
 
 impl MemfdSecret {
     pub fn new(len: usize) -> Result<Self, uapi::Errno> {
-        Self::new_with(len, uapi::c::FD_CLOEXEC as uapi::c::c_uint)
+        Self::new_with(len, uapi::c::O_CLOEXEC as uapi::c::c_uint)
     }
 
     pub fn new_with(len: usize, memfd_flags: libc::c_uint) -> Result<Self, uapi::Errno> {

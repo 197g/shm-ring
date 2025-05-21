@@ -228,11 +228,17 @@ impl ShmIoUring {
 
         let head = ring.ring_head();
         let blocking = &head.blocked.0;
+
         let loaded = blocking.load(atomic::Ordering::Relaxed);
+        let indicator = head.send_indicator(!ring.side());
 
         // Line is going down.
         if (loaded as i32) < 0 {
             return Ok(WaitResult::RemoteBlocked);
+        }
+
+        if indicator.load(atomic::Ordering::Relaxed) != 0 {
+            return Ok(WaitResult::Ok);
         }
 
         let submit = self.non_empty_submission_and_then_sync(2).await?;
@@ -241,7 +247,6 @@ impl ShmIoUring {
         let [fblock, fsend] = Rc::get_mut(&mut wakes).unwrap();
 
         *fblock = unsafe { FutexWaitv::from_u32_unchecked(blocking, loaded) };
-        let indicator = head.send_indicator(!ring.side());
         *fsend = unsafe { FutexWaitv::from_u32_unchecked(indicator, 0) };
 
         let key = self.establish_notice();
