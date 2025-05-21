@@ -134,9 +134,8 @@ fn main() -> Result<(), Error> {
     let map = MmapRaw::from_fd(&server).unwrap();
     // Fulfills all the pre-conditions of alignment to map.
     let shared = Shared::new(map).unwrap();
-    let client = shared.into_client().expect("Have initialized client");
-
     let tid = ClientIdentifier::from_pid();
+    let client = shared.into_client(tid).expect("Have initialized client");
 
     let mut config = wasmtime::Config::new();
     config.async_support(true);
@@ -146,10 +145,10 @@ fn main() -> Result<(), Error> {
     let programs = options
         .modules
         .iter()
-        .map(|mod_options| new_program(&engine, &mod_options, &client, tid, opt_path.to_path_buf()))
+        .map(|mod_options| new_program(&engine, &mod_options, &client, opt_path.to_path_buf()))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let host = host(&options, &client, tid)?;
+    let host = host(&options, &client)?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
@@ -199,7 +198,6 @@ fn new_program(
     engine: &wasmtime::Engine,
     options: &WasmModule,
     client: &Client,
-    tid: ClientIdentifier,
     opt_path: PathBuf,
 ) -> Result<Program, Error> {
     let WasmModule::WasiV1 {
@@ -209,9 +207,9 @@ fn new_program(
         stderr,
     } = &options;
 
-    let stdin = join_ring(stdin.as_ref(), client, tid)?;
-    let stdout = join_ring(stdout.as_ref(), client, tid)?;
-    let stderr = join_ring(stderr.as_ref(), client, tid)?;
+    let stdin = join_ring(stdin.as_ref(), client)?;
+    let stdout = join_ring(stdout.as_ref(), client)?;
+    let stderr = join_ring(stderr.as_ref(), client)?;
 
     let module = opt_path.join(module);
     let module = module.canonicalize()?;
@@ -228,10 +226,10 @@ fn new_program(
     })
 }
 
-fn host(options: &Options, client: &Client, tid: ClientIdentifier) -> Result<Host, Error> {
-    let stdin = join_ring(options.stdin.as_ref(), client, tid)?;
-    let stdout = join_ring(options.stdout.as_ref(), client, tid)?;
-    let stderr = join_ring(options.stderr.as_ref(), client, tid)?;
+fn host(options: &Options, client: &Client) -> Result<Host, Error> {
+    let stdin = join_ring(options.stdin.as_ref(), client)?;
+    let stdout = join_ring(options.stdout.as_ref(), client)?;
+    let stderr = join_ring(options.stderr.as_ref(), client)?;
 
     Ok(Host {
         stdin,
@@ -243,14 +241,12 @@ fn host(options: &Options, client: &Client, tid: ClientIdentifier) -> Result<Hos
 fn join_ring(
     options: Option<&StreamOptions>,
     client: &Client,
-    tid: ClientIdentifier,
 ) -> Result<Option<Ring>, RingJoinError> {
     options
         .map(|opt| {
             let mut ring = client.join(&RingRequest {
                 index: RingIndex(opt.index),
                 side: opt.side,
-                tid,
             });
 
             if let Ok(ring) = &mut ring {

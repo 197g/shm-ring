@@ -11,6 +11,7 @@ use crate::{data, frame, ring, uapi};
 pub struct Client {
     ring: frame::Shared,
     head: ClientHead,
+    tid: data::ClientIdentifier,
 }
 
 /// An owning wrapper of a portion of a ring on the SHM-PBX map.
@@ -39,7 +40,6 @@ pub struct RingAssertion<'lt> {
 pub struct RingRequest {
     pub index: data::RingIndex,
     pub side: data::ClientSide,
-    pub tid: data::ClientIdentifier,
 }
 
 /// The read-out descriptor of a ring.
@@ -123,7 +123,10 @@ struct RingMap {
 }
 
 impl Client {
-    pub(crate) unsafe fn new(ring: frame::Shared) -> Result<Self, ClientError> {
+    pub(crate) unsafe fn new(
+        ring: frame::Shared,
+        tid: data::ClientIdentifier,
+    ) -> Result<Self, ClientError> {
         let info_tail = ring.tail();
         // Safety: we store the shared memory.
         let info_tail = unsafe { &*info_tail };
@@ -167,7 +170,7 @@ impl Client {
             rings: unsafe { &*(rings as *const data::Rings) },
         };
 
-        Ok(Client { ring, head })
+        Ok(Client { ring, head, tid })
     }
 
     pub(crate) fn shared_head(&self) -> &data::ShmHead {
@@ -209,7 +212,7 @@ impl Client {
             .ok_or(RingJoinError::BadRingOffsetRing)?;
 
         let slot = ring_info.select_slot(req.side);
-        let ring_id = match slot.insert(req.tid) {
+        let ring_id = match slot.insert(self.tid) {
             Ok(id) => id,
             Err(None) => return Err(RingJoinError::Unavailable),
             Err(Some(id)) => return Err(RingJoinError::Taken(id)),
@@ -218,7 +221,7 @@ impl Client {
         // Immediately afterwards we are responsible for that region.
         let owned_ring = OwnedRingSlot {
             head: unsafe { &*head },
-            identity: req.tid,
+            identity: self.tid,
             info: ring_info,
             side: req.side,
         };
@@ -303,17 +306,6 @@ impl Ring {
         // parts of the effect of having checked two values.
         let block = &self.map.ring_slot.head.blocked.0;
         let owner = self.map.ring_slot.side.as_block_slot();
-
-        impl Drop for RingAssertion<'_> {
-            fn drop(&mut self) {
-                let _ = self.block.compare_exchange_weak(
-                    self.owner,
-                    0,
-                    atomic::Ordering::Relaxed,
-                    atomic::Ordering::Relaxed,
-                );
-            }
-        }
 
         let prior = block.compare_exchange_weak(
             0,
@@ -539,6 +531,17 @@ impl RingAssertion<'_> {
 
     pub(crate) fn block(&self) -> &atomic::AtomicU32 {
         self.block
+    }
+}
+
+impl Drop for RingAssertion<'_> {
+    fn drop(&mut self) {
+        let _ = self.block.compare_exchange_weak(
+            self.owner,
+            0,
+            atomic::Ordering::Relaxed,
+            atomic::Ordering::Relaxed,
+        );
     }
 }
 

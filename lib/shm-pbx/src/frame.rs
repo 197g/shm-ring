@@ -74,9 +74,12 @@ impl Shared {
     /// This does not join any specific ring, nor precludes the process from _also_ acting as a
     /// server. Merely it checks if the server structure exists and can be utilized, as well as
     /// resolve the addresses with a consistency check with the underlying mapped memory.
-    pub fn into_client(&self) -> Result<client::Client, client::ClientError> {
+    pub fn into_client(
+        &self,
+        tid: data::ClientIdentifier,
+    ) -> Result<client::Client, client::ClientError> {
         // Safety: exactly fulfills the preconditions, ours by definition.
-        unsafe { client::Client::new(self.clone()) }
+        unsafe { client::Client::new(self.clone(), tid) }
     }
 
     /// Get the memory of the file, which is after the head page.
