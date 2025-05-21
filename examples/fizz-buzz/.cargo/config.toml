@@ -1,5 +1,2 @@
 [build]
 target = "wasm32-wasip1"
-
-[unstable]
-build-std = ["core", "alloc", "panic_abort", "std"]

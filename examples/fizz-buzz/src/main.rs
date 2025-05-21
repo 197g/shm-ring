@@ -1,6 +1,5 @@
 use std::io::{self, BufRead as _, Write as _};
 
-#[no_mangle]
 pub fn main() -> Result<(), std::io::Error> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
