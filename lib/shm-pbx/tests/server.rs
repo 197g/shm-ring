@@ -28,20 +28,19 @@ fn create_server() {
     }];
 
     let shared_client = shared.clone();
-    assert!(shared_client.into_client().is_err());
+    let tid = ClientIdentifier::from_pid();
+    assert!(shared_client.into_client(tid).is_err());
 
     let shared_server = shared.clone();
     let server = unsafe { shared_server.into_server(ServerConfig { vec: &rings }) };
     let server = server.expect("Have initialized server");
 
-    let shared_client = shared.clone().into_client();
+    let shared_client = shared.clone().into_client(tid);
     let client = shared_client.expect("Have initialized client");
 
-    let tid = ClientIdentifier::from_pid();
     let join_lhs = client.join(&RingRequest {
         side: ClientSide::Left,
         index: RingIndex(0),
-        tid,
     });
 
     assert!(join_lhs.is_ok());
@@ -51,7 +50,6 @@ fn create_server() {
         let join = client.join(&RingRequest {
             side: ClientSide::Left,
             index: RingIndex(0),
-            tid,
         });
 
         assert!(join.is_err());
@@ -62,17 +60,14 @@ fn create_server() {
         let join = client.join(&RingRequest {
             side: ClientSide::Left,
             index: RingIndex(1),
-            tid,
         });
 
         assert!(join.is_err());
     }
 
-    let tid = ClientIdentifier::from_pid();
     let join_rhs = client.join(&RingRequest {
         side: ClientSide::Right,
         index: RingIndex(0),
-        tid,
     });
 
     assert!(join_rhs.is_ok());
@@ -80,11 +75,9 @@ fn create_server() {
     drop(join_lhs);
 
     // We can not immediately join it again, we've given the slot up to the server.
-    let tid = ClientIdentifier::from_pid();
     let join_rhs = client.join(&RingRequest {
         side: ClientSide::Right,
         index: RingIndex(0),
-        tid,
     });
 
     assert!(join_rhs.is_err());
@@ -93,7 +86,6 @@ fn create_server() {
     let join_rhs = client.join(&RingRequest {
         side: ClientSide::Right,
         index: RingIndex(0),
-        tid,
     });
 
     assert!(

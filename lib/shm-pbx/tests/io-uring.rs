@@ -34,20 +34,18 @@ async fn sync_rings() {
     let server = unsafe { shared_server.into_server(ServerConfig { vec: &rings }) };
     let server = server.expect("Have initialized server");
 
-    let shared_client = shared.clone().into_client();
+    let tid = ClientIdentifier::from_pid();
+    let shared_client = shared.clone().into_client(tid);
     let client = shared_client.expect("Have initialized client");
 
-    let tid = ClientIdentifier::from_pid();
     let join_lhs = client.join(&RingRequest {
         side: ClientSide::Left,
         index: RingIndex(0),
-        tid,
     });
 
     let join_rhs = client.join(&RingRequest {
         side: ClientSide::Right,
         index: RingIndex(0),
-        tid,
     });
 
     let lhs = join_lhs.expect("Have initialized left side");
