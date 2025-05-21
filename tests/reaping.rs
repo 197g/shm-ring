@@ -38,14 +38,14 @@ fn create_server() {
     let shared_client = shared.clone().into_client();
     let client = shared_client.expect("Have initialized client");
 
-    let tid = ClientIdentifier::new();
+    let tid = ClientIdentifier::from_pid();
     let join_lhs = client.join(&RingRequest {
         side: ClientSide::Left,
         index: RingIndex(0),
         tid,
     });
 
-    let tid = ClientIdentifier::new();
+    let tid = ClientIdentifier::from_pid();
     let join_rhs = client.join(&RingRequest {
         side: ClientSide::Right,
         index: RingIndex(0),

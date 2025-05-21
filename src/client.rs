@@ -295,9 +295,9 @@ impl Ring {
         match prior {
             Ok(_) => Ok(RingAssertion { block, owner }),
             // FIXME: return an error indicating we're shutting down, other side blocked indefinitely.
-            Err(prior) if prior as i32 <= 0 => return Err(WaitResult::Error),
+            Err(prior) if prior as i32 <= 0 => Err(WaitResult::Error),
             // FIXME: return a different error, already blocked.
-            Err(_prior) => return Err(WaitResult::Error),
+            Err(_prior) => Err(WaitResult::Error),
         }
     }
 
@@ -507,7 +507,7 @@ impl RingAssertion<'_> {
     }
 
     pub(crate) fn block(&self) -> &atomic::AtomicU32 {
-        &self.block
+        self.block
     }
 }
 
@@ -544,7 +544,7 @@ impl OwnedRingSlot {
         // shut down).
         let owner = (!self.side).as_block_slot();
 
-        if let Err(_) = slot.cmp_requeue(owner, 0, producer, i32::MAX) {
+        if slot.cmp_requeue(owner, 0, producer, i32::MAX).is_err() {
             // Oh, the lock wasn't actually taken. Obviously if we'd have taken the lock then we
             // wouldn't be running in this. Right?
         };

@@ -21,7 +21,7 @@ const _: () = {
 
 impl data::ClientIdentifier {
     #[cfg(feature = "uapi")]
-    pub fn new() -> Self {
+    pub fn from_pid() -> Self {
         let pid = uapi::getpid();
         assert!(pid > 0, "Unsupported pid {pid} reported from the OS");
         // It's necessary that any change to a PID results in a change in the low 32-bits, the size

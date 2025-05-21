@@ -129,9 +129,9 @@ pub struct RingInfo {
 
 const _: () = {
     const ASSERT: [(); 1] = [(); 1];
-    ASSERT[(core::mem::offset_of!(RingInfo, lhs) % ANTI_INTERFERENCE_ALIGN_AND_SIZE) as usize];
-    ASSERT[(core::mem::offset_of!(RingInfo, rhs) % ANTI_INTERFERENCE_ALIGN_AND_SIZE) as usize];
-    ASSERT[(core::mem::offset_of!(RingInfo, _eos) % ANTI_INTERFERENCE_ALIGN_AND_SIZE) as usize];
+    ASSERT[(core::mem::offset_of!(RingInfo, lhs) % ANTI_INTERFERENCE_ALIGN_AND_SIZE)];
+    ASSERT[(core::mem::offset_of!(RingInfo, rhs) % ANTI_INTERFERENCE_ALIGN_AND_SIZE)];
+    ASSERT[(core::mem::offset_of!(RingInfo, _eos) % ANTI_INTERFERENCE_ALIGN_AND_SIZE)];
 };
 
 #[repr(C)]
@@ -151,7 +151,7 @@ pub struct RingHead {
 
 const _: () = {
     const ASSERT: [(); 1] = [(); 1];
-    ASSERT[(core::mem::offset_of!(RingHead, _eos) % ANTI_INTERFERENCE_ALIGN_AND_SIZE) as usize];
+    ASSERT[(core::mem::offset_of!(RingHead, _eos) % ANTI_INTERFERENCE_ALIGN_AND_SIZE)];
 
     assert!(
         core::mem::size_of::<RingHead>() <= 4096,
@@ -166,13 +166,9 @@ impl RingBlockedSlot {
     pub fn block(&self, side: ClientSide) -> Result<(), i32> {
         let block_val = side.as_block_slot();
 
-        match self.0
-            .compare_exchange_weak(
-                0,
-                block_val,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            )
+        match self
+            .0
+            .compare_exchange_weak(0, block_val, Ordering::Relaxed, Ordering::Relaxed)
         {
             Ok(_) => Ok(()),
             Err(n) if n == block_val => Ok(()),
@@ -181,14 +177,12 @@ impl RingBlockedSlot {
     }
 
     pub fn unblock(&self, side: ClientSide) -> Result<(), i32> {
-        match self.0
-            .compare_exchange_weak(
-                side.as_block_slot(),
-                0,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            )
-        {
+        match self.0.compare_exchange_weak(
+            side.as_block_slot(),
+            0,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
             Ok(_) => Ok(()),
             Err(n) if n == 0 => Ok(()),
             Err(u) => Err(u as i32),
@@ -231,13 +225,10 @@ pub struct RingHeadHalf {
 
 const _: () = {
     const ASSERT: [(); 1] = [(); 1];
-    ASSERT[(core::mem::offset_of!(RingHeadHalf, producer) % ANTI_INTERFERENCE_ALIGN_AND_SIZE)
-        as usize];
-    ASSERT[(core::mem::offset_of!(RingHeadHalf, consumer) % ANTI_INTERFERENCE_ALIGN_AND_SIZE)
-        as usize];
-    ASSERT[(core::mem::offset_of!(RingHeadHalf, send_indicator) % ANTI_INTERFERENCE_ALIGN_AND_SIZE)
-        as usize];
-    ASSERT[(core::mem::offset_of!(RingHeadHalf, _eos) % ANTI_INTERFERENCE_ALIGN_AND_SIZE) as usize];
+    ASSERT[(core::mem::offset_of!(RingHeadHalf, producer) % ANTI_INTERFERENCE_ALIGN_AND_SIZE)];
+    ASSERT[(core::mem::offset_of!(RingHeadHalf, consumer) % ANTI_INTERFERENCE_ALIGN_AND_SIZE)];
+    ASSERT[(core::mem::offset_of!(RingHeadHalf, send_indicator) % ANTI_INTERFERENCE_ALIGN_AND_SIZE)];
+    ASSERT[(core::mem::offset_of!(RingHeadHalf, _eos) % ANTI_INTERFERENCE_ALIGN_AND_SIZE)];
 };
 
 /// Wraps memory, not allowing *any* access.
@@ -261,6 +252,12 @@ pub struct ClientIdentifier(pub(crate) u64);
 #[repr(transparent)]
 pub struct RingIdentifier(pub(crate) i32);
 
+impl Default for RingMagic {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RingMagic {
     const MAGIC: u64 = 0x9e6c_a4fd8624a738;
 
@@ -275,7 +272,7 @@ impl RingMagic {
 
 impl Rings {
     pub fn get(&self, RingIndex(idx): RingIndex) -> Option<&RingInfo> {
-        self.0.get(idx as usize)
+        self.0.get(idx)
     }
 }
 
@@ -391,7 +388,10 @@ impl ClientSlot {
                 });
 
         match acquisition {
-            Ok(_id) => Ok(debug_assert_eq!(_id, 0)),
+            Ok(_id) => {
+                debug_assert_eq!(_id, 0);
+                Ok(())
+            }
             Err(id) => {
                 if id > 0 {
                     Err(Some(ClientIdentifier(id as u64)))
@@ -526,7 +526,7 @@ pub(crate) fn align_offset_val(ptr: *const u8, layout: alloc::Layout) -> usize {
 
 #[test]
 fn align_offset_is_correct() {
-    assert_eq!(align_offset::<u64>(0usize as *const u8), 0);
+    assert_eq!(align_offset::<u64>(std::ptr::null::<u8>()), 0);
     assert_eq!(align_offset::<u64>(1usize as *const u8), 7);
     assert_eq!(align_offset::<u64>(2usize as *const u8), 6);
     assert_eq!(align_offset::<u64>(3usize as *const u8), 5);

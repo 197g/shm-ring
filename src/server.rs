@@ -231,7 +231,7 @@ impl Server {
     }
 
     pub(crate) fn head(&self) -> &data::ShmHead {
-        &self.server.head
+        self.server.head
     }
 
     fn borrow_ring_head(&self, slot: &data::RingInfo) -> &data::RingHead {
@@ -252,7 +252,7 @@ impl Server {
             let start = range.start;
 
             if range.end.checked_sub(start) < Some(len) {
-                return Err(ServerError::TooSmall)?;
+                Err(ServerError::TooSmall)?;
             }
 
             range.start += len;

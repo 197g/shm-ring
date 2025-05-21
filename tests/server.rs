@@ -37,7 +37,7 @@ fn create_server() {
     let shared_client = shared.clone().into_client();
     let client = shared_client.expect("Have initialized client");
 
-    let tid = ClientIdentifier::new();
+    let tid = ClientIdentifier::from_pid();
     let join_lhs = client.join(&RingRequest {
         side: ClientSide::Left,
         index: RingIndex(0),
@@ -68,7 +68,7 @@ fn create_server() {
         assert!(join.is_err());
     }
 
-    let tid = ClientIdentifier::new();
+    let tid = ClientIdentifier::from_pid();
     let join_rhs = client.join(&RingRequest {
         side: ClientSide::Right,
         index: RingIndex(0),
@@ -80,7 +80,7 @@ fn create_server() {
     drop(join_lhs);
 
     // We can not immediately join it again, we've given the slot up to the server.
-    let tid = ClientIdentifier::new();
+    let tid = ClientIdentifier::from_pid();
     let join_rhs = client.join(&RingRequest {
         side: ClientSide::Right,
         index: RingIndex(0),
