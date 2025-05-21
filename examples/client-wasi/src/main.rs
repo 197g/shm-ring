@@ -5,14 +5,14 @@ use shm_pbx::client::{Client, Ring, RingJoinError, RingRequest};
 use shm_pbx::data::{ClientIdentifier, ClientSide, RingIndex};
 use shm_pbx::frame::Shared;
 use shm_pbx::io_uring::ShmIoUring;
+use shm_pbx::MmapRaw;
 
-use memmap2::MmapRaw;
 use quick_error::quick_error;
 use serde::Deserialize;
 use wasmtime::{Instance, Module, Store};
 use wasmtime_wasi::{preview1, WasiCtxBuilder};
 
-use std::{fs, path::PathBuf, rc, sync};
+use std::{fs, path::PathBuf, rc};
 
 #[derive(Deserialize)]
 struct Options {
@@ -131,12 +131,12 @@ fn main() -> Result<(), Error> {
         .write(true)
         .open(server)?;
 
-    let map = MmapRaw::map_raw(&server).unwrap();
+    let map = MmapRaw::from_fd(&server).unwrap();
     // Fulfills all the pre-conditions of alignment to map.
     let shared = Shared::new(map).unwrap();
     let client = shared.into_client().expect("Have initialized client");
 
-    let tid = ClientIdentifier::new();
+    let tid = ClientIdentifier::from_pid();
 
     let mut config = wasmtime::Config::new();
     config.async_support(true);

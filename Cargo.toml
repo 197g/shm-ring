@@ -6,10 +6,10 @@ rust-version = "1.70"
 
 [dependencies]
 io-uring = { version = "0.7", optional = true }
-hashbrown = "0.14.3"
+hashbrown = "0.15"
 libc = { version = "0.2" }
 # Synchronous waiting with a futex interface
-linux-futex = "0.2"
+linux-futex = "1"
 # Using the high-level crate instead of `libc` as an abstraction of safe
 # patterns. Also I'm hoping to encourage (myself, other authors) to contribute
 # towards such stable, idiomatic bindings as its official support list is
