@@ -11,3 +11,13 @@ resolver = "2"
 
 [workspace.dependencies]
 shm-pbx = { path = "lib/shm-pbx", version = "0.0.0" }
+
+clap = { version = "4" }
+io-uring = { version = "0.7" }
+libc = { version = "0.2" }
+linux-futex = "1"
+uapi = "0.2.13"
+quick-error = { version = "1" }
+slotmap = { version = "1", default-features = false }
+tempfile = "3.10"
+tokio = { version = "1" }

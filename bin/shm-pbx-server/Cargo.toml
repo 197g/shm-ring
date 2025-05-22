@@ -3,18 +3,19 @@ name = "shm-pbx-server"
 version = "0.0.0"
 edition = "2021"
 rust-version = "1.70"
+publish = false
 
 [[bin]]
 name = "shm-pbx-server"
 path = "src/main.rs"
 
 [dependencies]
-shm-pbx.workspace = true
+shm-pbx = { workspace = true, features = ["io-uring"] }
 # Just binaries, this is our interface.
-clap = { version = "4", features = ["cargo"] }
-quick-error = "1"
+clap = { workspace = true, features = ["cargo"] }
+quick-error.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tempfile = "3.10"
-tokio = { version = "1", features = ["macros", "net", "sync", "rt"] }
-uapi = { version = "0.2.13" }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "sync", "rt"] }
+uapi.workspace = true
