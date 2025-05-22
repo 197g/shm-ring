@@ -11,7 +11,7 @@ use bytes::Bytes;
 use shm_pbx::client::{Ring, WaitResult};
 use shm_pbx::io_uring::ShmIoUring;
 use tokio::sync::Semaphore;
-use wasmtime_wasi::{HostInputStream, HostOutputStream, StreamResult, Subscribe};
+use wasmtime_wasi::p2::{self, Pollable, StreamError, StreamResult};
 
 #[derive(Clone)]
 pub struct InputRing {
@@ -247,7 +247,7 @@ impl InputRing {
     }
 }
 
-impl HostInputStream for InputRing {
+impl p2::InputStream for InputRing {
     // Required method
     fn read(&mut self, size: usize) -> StreamResult<Bytes> {
         if let Some(name) = self.name {
@@ -259,7 +259,7 @@ impl HostInputStream for InputRing {
             return if !self.inner.notify_produced.is_closed() {
                 Ok(Bytes::default())
             } else {
-                Err(wasmtime_wasi::StreamError::Closed)
+                Err(StreamError::Closed)
             };
         };
 
@@ -276,7 +276,7 @@ impl HostInputStream for InputRing {
 }
 
 #[wasmtime_wasi::async_trait]
-impl Subscribe for InputRing {
+impl Pollable for InputRing {
     async fn ready(&mut self) {
         if let Some(name) = self.name {
             eprintln!("{name}: Wait");
@@ -512,10 +512,10 @@ impl OutputRing {
     }
 }
 
-impl HostOutputStream for OutputStream {
+impl p2::OutputStream for OutputStream {
     fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
         let Some(notify_produced) = self.inner.notify_produced.upgrade() else {
-            return Err(wasmtime_wasi::StreamError::Closed);
+            return Err(StreamError::Closed);
         };
 
         if let Some(name) = self.name {
@@ -541,7 +541,7 @@ impl HostOutputStream for OutputStream {
 
     fn flush(&mut self) -> StreamResult<()> {
         let Some(notify_produced) = self.inner.notify_produced.upgrade() else {
-            return Err(wasmtime_wasi::StreamError::Closed);
+            return Err(StreamError::Closed);
         };
 
         if let Some(name) = self.name {
@@ -563,7 +563,7 @@ impl HostOutputStream for OutputStream {
 
     fn check_write(&mut self) -> StreamResult<usize> {
         if self.inner.notify_produced.is_closed() {
-            return Err(wasmtime_wasi::StreamError::Closed);
+            return Err(StreamError::Closed);
         };
 
         if self.inner.flush_pending() {
@@ -598,7 +598,7 @@ impl OutputInner {
 }
 
 #[wasmtime_wasi::async_trait]
-impl Subscribe for OutputStream {
+impl Pollable for OutputStream {
     async fn ready(&mut self) {
         if self.inner.notify_produced.is_closed() {
             return;

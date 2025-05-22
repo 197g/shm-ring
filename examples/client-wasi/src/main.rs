@@ -10,7 +10,7 @@ use shm_pbx::MmapRaw;
 use quick_error::quick_error;
 use serde::Deserialize;
 use wasmtime::{Instance, Module, Store};
-use wasmtime_wasi::{preview1, WasiCtxBuilder};
+use wasmtime_wasi::{p2::StreamError, p2::WasiCtxBuilder, preview1};
 
 use std::{fs, path::PathBuf, rc};
 
@@ -266,8 +266,8 @@ struct Stdout {
     inner: stream::OutputRing,
 }
 
-impl wasmtime_wasi::StdinStream for Stdin {
-    fn stream(&self) -> Box<dyn wasmtime_wasi::HostInputStream> {
+impl wasmtime_wasi::p2::StdinStream for Stdin {
+    fn stream(&self) -> Box<dyn wasmtime_wasi::p2::InputStream> {
         Box::new(self.inner.clone())
     }
 
@@ -276,8 +276,8 @@ impl wasmtime_wasi::StdinStream for Stdin {
     }
 }
 
-impl wasmtime_wasi::StdoutStream for Stdout {
-    fn stream(&self) -> Box<dyn wasmtime_wasi::HostOutputStream> {
+impl wasmtime_wasi::p2::StdoutStream for Stdout {
+    fn stream(&self) -> Box<dyn wasmtime_wasi::p2::OutputStream> {
         Box::new(self.inner.stream())
     }
 
@@ -387,7 +387,7 @@ async fn move_stdin(
     local: &tokio::task::LocalSet,
 ) -> Result<(), ClientRunError> {
     use tokio::io::AsyncBufReadExt as _;
-    use wasmtime_wasi::HostOutputStream as _;
+    use wasmtime_wasi::p2::OutputStream as _;
 
     let proxy = stream::OutputRing::new(ring, uring.clone(), &local);
     let mut proxy = proxy.stream();
@@ -405,14 +405,14 @@ async fn move_stdin(
 
         let write = match proxy.check_write() {
             Ok(n) => buf.len().min(n).min(SIZE),
-            Err(wasmtime_wasi::StreamError::Closed) => break,
+            Err(StreamError::Closed) => break,
             Err(_err) => unreachable!(),
         };
 
         if write == 0 {
             match proxy.write_ready().await {
                 Ok(_) => {}
-                Err(wasmtime_wasi::StreamError::Closed) => break,
+                Err(StreamError::Closed) => break,
                 Err(_err) => panic!(),
             }
 
@@ -422,7 +422,7 @@ async fn move_stdin(
         let bytes = bytes::Bytes::copy_from_slice(&buf[..write]);
         match proxy.write(bytes) {
             Ok(()) => {}
-            Err(wasmtime_wasi::StreamError::Closed) => break,
+            Err(StreamError::Closed) => break,
             Err(_err) => panic!(),
         };
 
@@ -439,7 +439,7 @@ async fn move_stdout(
     local: &tokio::task::LocalSet,
 ) -> Result<(), ClientRunError> {
     use tokio::io::AsyncWriteExt as _;
-    use wasmtime_wasi::{HostInputStream as _, Subscribe};
+    use wasmtime_wasi::p2::{InputStream as _, Pollable as _};
 
     let mut proxy = stream::InputRing::new(ring, uring.clone(), &local);
     let mut stdout = tokio::io::BufWriter::new(tokio::io::stdout());
@@ -453,7 +453,7 @@ async fn move_stdout(
                 proxy.ready().await;
                 continue;
             }
-            Err(wasmtime_wasi::StreamError::Closed) => break,
+            Err(StreamError::Closed) => break,
             Err(err) => {
                 eprintln!("{err:?}");
                 panic!()
